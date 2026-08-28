@@ -4,8 +4,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import config
-from .wsl_bridge import WslUnavailableError, run_posix_tool, to_wsl_path
+from .wsl_bridge import WslUnavailableError, run_posix_tool
 
 
 @dataclass
@@ -96,10 +95,32 @@ def run_ansible_lint(role_dir: Path) -> ScanResult:
     there separately from this project's venv - scripts/check_wsl_tools.py);
     on other platforms (e.g. Linux CI runners) it runs directly, since
     ansible-core has nothing to route around there.
+
+    Excludes the role's own molecule/ subdirectory: every generated role
+    has one (molecule_writer.py, week 4), and its converge.yml references
+    the role under the namespaced name ansible-compat's local-role-install
+    step creates at test time (ROLE_NAMESPACE, ansible_writer.py) - a
+    symlink under ~/.ansible/roles/ that doesn't exist yet on a scan-only
+    invocation. Without this exclusion ansible-lint's syntax-check fails
+    with "role ... was not found" - confirmed by reproducing it in CI on a
+    genuinely fresh checkout (a passing local result earlier turned out to
+    be masked by a leftover symlink from this session's own prior
+    molecule runs, not evidence the scan path was actually clean).
+
+    Invoked with role_dir itself as the working directory (target "."),
+    not an absolute/WSL-translated path: without an explicit cwd,
+    ansible-lint's own project-root discovery fell back to some much
+    broader default scope (86 files "encountered" for a 5-file role) that
+    silently dropped a real, unrelated finding (yaml[truthy] on
+    tasks/main.yml) from the reported results entirely - confirmed by
+    reproducing the same scan with and without an explicit cwd and
+    comparing "N files encountered" in each. A scan that finds fewer real
+    issues than it should is worse than one that's merely noisy, so this
+    was worth chasing down rather than accepting the exclusion at face
+    value once it made ansible-lint "pass."
     """
-    target = to_wsl_path(role_dir) if config.RUNS_ON_WINDOWS else str(role_dir)
     try:
-        proc = run_posix_tool(f"ansible-lint --format json {target}")
+        proc = run_posix_tool("ansible-lint --format json --exclude molecule .", cwd=role_dir)
     except WslUnavailableError as exc:
         return ScanResult(tool="ansible-lint", passed=None, error=str(exc))
 

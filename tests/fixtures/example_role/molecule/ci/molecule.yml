@@ -22,5 +22,14 @@ platforms:
     command: /usr/sbin/init
 provisioner:
   name: ansible
+  # Confirmed by running this job: the Docker connection plugin's exec
+  # context doesn't resolve $HOME, so Ansible's default remote_tmp
+  # (~/.ansible/tmp) expanded to the literal path "/.ansible/tmp" (root
+  # of the filesystem, no home directory component at all) and failed to
+  # create it - exactly the failure Ansible's own error message suggests
+  # this fixes ("change the remote tmp path... to a path rooted in /tmp").
+  config_options:
+    defaults:
+      remote_tmp: /tmp/.ansible/tmp
 verifier:
   name: ansible
