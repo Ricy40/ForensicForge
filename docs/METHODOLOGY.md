@@ -894,6 +894,103 @@ planted, prove it was planted, not that it happened to already be
 there), and made closing it this week's opening move before the actual
 forensic-scenario work, since the same mechanism serves both.
 
+### Getting CI to actually pass
+
+Week 4 built `.github/workflows/validate.yml` but never pushed it - this
+week's first job was to actually exercise it, not just have it exist.
+Doing that surfaced a chain of real bugs, none of which unit tests or
+local WSL testing had caught, because none of them could have: they were
+specific to running on a genuinely fresh checkout, on Linux, on someone
+else's infrastructure, none of which this session's own environment
+(Windows + WSL + this project's own accumulated local state) actually is.
+
+An unrelated detour happened first: partway through this week, the local
+git repository's history was lost (a `.git` deletion during an editor
+mishap, then a fresh `git init` and push to recover) - everything from
+weeks 1-4 collapsed into a single "Initial commit," and one file
+(`.github/workflows/validate.yml` itself) didn't survive the recovery at
+all, silently dropped rather than corrupted. Rewritten from scratch
+(the content was still fresh from having authored it days earlier) and
+re-pushed before CI could be exercised at all - recorded here since it's
+a real, if mundane, thing that happened this week, not because it changed
+any actual project decisions.
+
+With the workflow actually running, CI failed both jobs on the first
+real push, then kept surfacing new, different, genuine failures as each
+was fixed - five in total, each one something no amount of local testing
+in this specific environment would have shown:
+
+1. **`ansible-lint` was never installed on the CI runner.** `ci_scan.py`
+   correctly reported it unavailable and failed the job (exactly the
+   behavior week 4 designed it to have) rather than silently skipping it
+   - the fix was adding the missing `pip install ansible-lint` step, not
+   a workaround. `ansible-lint`'s absence from `pyproject.toml` is
+   deliberate (Windows-incompatible, see week 4), but that means every
+   environment that needs it - WSL locally, the CI runner here - needs
+   its own explicit install, which the workflow had simply forgotten for
+   the runner.
+2. **The Docker image's Python was too old.** `geerlingguy/docker-ubuntu2004-ansible`
+   ships Python 3.8; the `ansible-core` this job pip-installs with no
+   version pin (whatever's current) requires 3.9+ on the managed node.
+   Fixed by switching to the `2204` (Ubuntu 22.04, Python 3.10) variant of
+   the same image family.
+3. **`ansible-lint`'s own scope was wrong, and this one mattered beyond
+   CI.** Scanning a role directory that contains a `molecule/`
+   subdirectory (every generated role has one - `molecule_writer.py`,
+   week 4) makes `ansible-lint` also try to syntax-check the scenario's
+   own `converge.yml`, whose namespaced role reference can't resolve
+   without Molecule's own local-role-install step having run first.
+   `--exclude molecule` fixed that specific error - but doing that
+   without also setting an explicit working directory changed
+   `ansible-lint`'s own project-root discovery enough to silently drop a
+   real, unrelated finding (`yaml[truthy]` on a completely different
+   file) from the results entirely, discovered only by comparing
+   "N files encountered" with and without an explicit `cwd` and noticing
+   it jumped from 5 to 86. A `passed: true` that turned out to be missing
+   real findings is a worse bug than a `passed: false` CI never reaches -
+   `scanners.run_ansible_lint()` now always passes `cwd=role_dir`
+   explicitly, and this fix applies to every role scan project-wide, not
+   just the CI fixture: a stale, seemingly-clean local result earlier in
+   the week turned out to have been accidentally masked the same way, by
+   a leftover role symlink from this session's own prior testing that a
+   genuinely fresh checkout would never have.
+4. **The container's temp-directory and systemd setup needed the
+   standard "systemd inside Docker" recipe.** Ansible's own error message
+   ("Failed to create temporary directory... consider a path rooted in
+   /tmp") pointed at the immediate cause (`remote_tmp` resolving to
+   `/.ansible/tmp` - no home directory component at all, because the
+   Docker connection plugin's exec context doesn't set `$HOME`) but
+   fixing just that wasn't sufficient; the container's systemd hadn't
+   finished initializing enough to provide a normal `/tmp`/`/run` at all.
+   `provisioner.config_options.defaults.remote_tmp` fixed the path;
+   an explicit `volumes: [/sys/fs/cgroup:/sys/fs/cgroup:rw]` and
+   `tmpfs: [/run, /run/lock]` (the standard, widely-documented recipe for
+   running systemd inside Docker, broader than `cgroupns_mode: host`
+   alone) fixed the rest. Confirmed against real research rather than
+   trial-and-error alone: the geerlingguy image's own issue tracker has
+   multiple open, maintainer-unresolved reports of this exact failure,
+   which is why this stopped at the standard documented recipe rather
+   than continuing to chase container internals - "don't gold-plate" cuts
+   both ways, and a well-established fix that worked was the point to
+   stop at.
+5. **The container's package index was stale.** Once the role actually
+   started converging, `Install OpenSSH server` failed with `No package
+   matching 'openssh-server' is available` - an ordinary stale apt cache,
+   not fixed by editing the fixture role itself (which stays a faithful,
+   unmodified copy of a real generated run) but by adding
+   `molecule/ci/prepare.yml`, a `ansible.builtin.apt: update_cache: true`
+   step Molecule already calls by convention if present (the "prepare:
+   Missing playbook" line in every earlier failed run's log was this
+   exact hook, sitting unused).
+
+Both jobs pass as of the final push this week. The two-minute-something
+runtime and the "Node.js 20 is deprecated" warnings on `actions/checkout@v4`/
+`actions/setup-python@v5` are GitHub's own infrastructure notices (already
+auto-mitigated by forcing those actions onto Node 24), not something in
+this project's control - left alone rather than chased, in the same
+"don't gold-plate" spirit as stopping at the standard systemd-in-Docker
+recipe above.
+
 ### Closing the attribution gap
 
 Ansible's default console output already prints exactly the distinction
