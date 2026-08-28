@@ -16,6 +16,7 @@ dependencies = [
     "python-hcl2>=8.1",
     "checkov>=3.3",
     "python-vagrant>=1.0",
+    "Faker>=30.0",
 ]
 
 [project.optional-dependencies]

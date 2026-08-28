@@ -881,6 +881,238 @@ exercised by an actual push yet as of writing - recorded honestly rather
 than presented as verified, consistent with how the WSL-dependent parts
 of this week are also flagged as code-complete-but-not-live-tested below.
 
+## Week 5: closing the attribution gap, and forensic scenario generation
+
+Week 4 ended on an open question: `test_deploy.py` verified that a
+generated VM's configuration ended up in the right end state, but not
+whether the role's own application had *caused* that state versus the
+base image already having it - the exact ambiguity that motivated week
+4 in the first place, still unresolved for `test_deploy.py` itself. The
+brief for this week named that gap "attribution," pointed out it's the
+same problem forensic evidence integrity has to solve (if evidence is
+planted, prove it was planted, not that it happened to already be
+there), and made closing it this week's opening move before the actual
+forensic-scenario work, since the same mechanism serves both.
+
+### Closing the attribution gap
+
+Ansible's default console output already prints exactly the distinction
+needed: a `TASK [<role> : <task name>]` header followed by `changed:` or
+`ok:` per host, depending on whether the task actually modified
+anything. `vagrant up`'s `ansible_local` provisioner streams this
+straight into the console output `test_deploy.py` was already capturing
+into `run_dir/vagrant.log` for error reporting (see week 4's
+python-vagrant section) - closing the gap turned out to mean parsing
+output already being captured, not adding any new instrumentation.
+
+`test_deploy.py` gained `parse_task_attribution()` (regex over
+`TASK [...]` headers and the following `ok:`/`changed:`/etc. line) and
+`CheckResult.attribution`, populated by matching each check's task name
+(via `DerivedCheck.task_name`, now carried alongside `command`/`expected`)
+against the parsed output. Verified against real output rather than
+assumed correct: rather than requiring a full VM boot (needing the
+user's elevated terminal) just to see what Ansible's console format
+actually looks like, the real generated role was run directly inside
+WSL against `localhost` - first in `--check` (dry-run) mode to confirm
+the format without touching anything, then for real against a throwaway
+file (never `/etc/ssh/sshd_config` itself) to see both a `changed:` on
+first application and an `ok:` on the idempotent second run. Both
+matched the parser's assumptions exactly.
+
+Two more things were found and fixed while wiring this up, both real
+correctness bugs rather than gaps:
+
+- A live `vagrant.log` from an earlier session showed `Machine already
+  provisioned. Run \`vagrant provision\` or use the \`--provision\` flag
+  to force provisioning` - meaning `test_deploy()`'s `v.up()` call,
+  without `provision=True`, could silently skip Ansible entirely on a
+  machine Vagrant's own bookkeeping considered already provisioned (from
+  an earlier attempt, possibly with different content). That would have
+  meant `test_deploy()`'s own checks could pass by observing *stale*
+  state from a previous run rather than this run's role - the general
+  form of the exact attribution problem this feature exists to close,
+  now closed for `test_deploy()` itself too: `v.up()` now always passes
+  `provision=True`, and `vagrant.log` is truncated fresh at the start of
+  each `test_deploy()` call so `parse_task_attribution()` only ever sees
+  the current run's output.
+- The naive timestamp handling for backdated artefacts (see below) had a
+  latent timezone bug: computing an expected epoch via
+  `datetime.fromisoformat(...).timestamp()` on a naive value uses *this
+  host's* local timezone, while the guest's `touch -d` would use *its*
+  local timezone - silently mismatched whenever the two differ. Fixed by
+  pinning both sides to UTC explicitly (a trailing `Z` on the `touch -d`
+  argument, `.replace(tzinfo=timezone.utc)` on the Python side) and
+  confirmed by computing the same value both ways and checking they
+  actually matched (`1767225600` for `2026-01-01T00:00:00`, both sides).
+
+**Status: closed**, not parked - `report.json`'s `test_deploy.checks[].attribution`
+is now real data (`"changed"` = this run's role/artefacts caused the
+state, `"ok"` = it was already there, `None` = the task never ran at
+all), live-verified against genuine Ansible output, not just unit-tested
+against a mocked one (though it is unit-tested that way too -
+`tests/test_validate.py`'s attribution tests mock the WSL boundary the
+same way the rest of week 4's tests do, for a fast, hermetic suite; the
+WSL localhost runs above were a one-off verification exercise, not part
+of the automated suite).
+
+### libguestfs vs. Ansible-based artefact planting
+
+The brief asked for a real feasibility check before committing to
+libguestfs, given this project's history of virtualization-stack
+surprises (VirtualBox blocked by Memory Integrity in week 3, WSL/Docker
+Desktop both hanging for an entire session in week 4). Checked rather
+than assumed: WSL2 on this machine does have `/dev/kvm` and the `vmx`
+CPU flag, meaning libguestfs's appliance *could* run accelerated rather
+than falling back to slow emulation - a genuinely promising finding,
+recorded here since it means the door isn't closed for a future need.
+
+Two reasons decided against using it *this week* regardless, one
+environmental and one about whether it would actually add anything:
+
+1. **Lifecycle mismatch.** libguestfs needs to open a VM's disk image
+   directly, which means the disk has to exist and not be locked by an
+   active hypervisor. This project's actual VM lifecycle
+   (`test_deploy()`: create → boot → verify → always destroy) never
+   leaves a window where that's true for a *per-scenario* disk - Vagrant
+   deletes the VHDX on `destroy()` every time. Making libguestfs work
+   would mean redesigning the boot lifecycle around it (stop-mount-modify-
+   restart, or pre-seeding the shared base box rather than per-run
+   disks), a materially bigger change than the artefact-generation work
+   itself.
+2. **Nothing in the brief's own example artefact list actually needs
+   disk-level access.** Fabricated log entries and shell history are
+   ordinary file writes. Backdated timestamps are exactly what `touch -d`
+   does from user space - no disk tool required. Deleted-file remnants
+   don't need libguestfs either: a real process unlinking a real file via
+   `rm`/`ansible.builtin.file: state=absent` leaves the same recoverable
+   unallocated-block state a disk-level deletion would, on any filesystem
+   that doesn't zero blocks on unlink by default (ext4 doesn't, absent
+   `discard`) - which is also, not incidentally, a more *realistic*
+   artefact than one injected from outside the running system, since a
+   real insider threat's deleted files get deleted by a live process too.
+
+Given libguestfs would cost real new environment risk for capability
+this project's actual artefact types don't need, **artefacts are planted
+through Ansible**, reusing exactly the `ansible_local` provisioner
+infrastructure week 3 already built and week 4/5 already verified works.
+Kept as a live option: if a future scenario genuinely needs something
+only disk-level access can produce (recovering *unplanted* pre-existing
+deleted data, say, rather than planting-then-deleting known content),
+the KVM finding above means it's not obviously a dead end - just not
+needed yet.
+
+### The forensics module
+
+`src/forensicforge/forensics/` adds:
+
+- **`storyline.py`** — `Artefact` (kind, description, target_path,
+  content, optional timestamp) and `Storyline` (id, title, narrative,
+  `base_spec`, artefacts). `base_spec` is fed into the existing
+  `generate_vm_spec()` RAG pipeline completely unchanged - a storyline is
+  what the machine should *look like it did*, layered on top of what the
+  machine actually *is* (an ordinary curriculum VM spec, generated the
+  same way every other run is).
+- **`generators.py`** — Faker-backed content: shell-history-shaped
+  commands (exfiltration, archiving, history-clearing), syslog-style auth
+  log lines, plain-text email drafts, and synthetic "client record" CSVs.
+  Every value is Faker-fabricated; nothing here accepts or embeds real
+  personal data - the same justification the research tracker already
+  gives for why this project's forensic track doesn't need ethics
+  approval.
+- **`planter.py`** — the core piece. For each artefact kind, builds the
+  Ansible task(s) that plant it *and* the verification check(s) that
+  confirm it, in the same function (`_build_task_and_check`), so the two
+  can never drift out of sync the way a hand-maintained pair of role and
+  test file could - the same reasoning behind `ROLE_NAMESPACE` in
+  `ansible_writer.py`. Four artefact kinds, four different Ansible/
+  verification shapes:
+  - `log_entry` / `shell_history` → `ansible.builtin.lineinfile`
+    (append), verified by grep - literally the same module and
+    verification pattern every generated scenario role already uses, so
+    this reuses `test_deploy.py`'s existing machinery with no new check
+    logic at all.
+  - `email_draft` → `ansible.builtin.copy` (whole file), verified by
+    grepping the `Subject:` header line specifically (a multi-line body
+    isn't a single grep -F target).
+  - `deleted_file` → write then `state: absent`, verified by confirming
+    *absence* (`test -e ... || echo CONFIRMED_ABSENT`) rather than
+    content.
+  - `backdated_file` → write then `touch -d '<timestamp>Z'`, verified by
+    `stat -c %Y` against the expected UTC epoch. The `touch` task is
+    given `changed_when: true` explicitly (ansible-lint's `no-changed-when`
+    rule correctly flags a bare shell command as unable to report
+    changed/ok reliably on its own) - meaning attribution for *this one
+    task* is always `"changed"` by design, a narrow, documented exception
+    to the general attribution mechanism rather than something worth a
+    bigger fix, since the timestamp check itself still confirms the
+    actual on-disk state regardless.
+
+  A second Ansible role (`forensic_artefacts`), not folded into the
+  scenario role: keeps "what the box is" separate from "what evidence is
+  on it," and `playbook.yml` is regenerated to run both roles in
+  sequence.
+
+  `CheckResult`/`DerivedCheck` gained a `category` field ("config" or
+  "artefact") so `test_deploy()` doesn't need to know anything about
+  storylines at all - it just runs whatever checks it's given and tags
+  results by whatever category they came in with.
+  `TestDeployResult.artefacts_verified` is tracked separately from
+  `config_verified` for the same reason: "did the baseline config land"
+  and "did the evidence get planted" are different questions once a run
+  mixes both kinds of check, and blending them into one flag would lose
+  that distinction.
+
+- **`scenarios.py`** — three demo storylines (below).
+- **`orchestrator.py`** — `provision_storyline()`, which calls the
+  existing `provision_spec()` unchanged for the scenario role, then
+  `write_artefact_role()` for the evidence.
+
+Real, tool-caught issues found while building this (not hypothetical -
+`ansible-lint` run against the actual generated artefact role):
+`risky-file-permissions` (the copy/lineinfile tasks had no explicit
+`mode:`, fixed with real values - `0600` for private files like shell
+history and email drafts, `0644` for things a real log file or note
+would plausibly have) and the `no-changed-when` finding on the `touch`
+task described above.
+
+### Demo scenarios
+
+Three storylines, not variations on one theme: a departing employee
+exfiltrating client data (the brief's own example), a sysadmin
+installing unauthorized remote access before being placed on leave, and
+a contractor deleting project files after being told their contract
+won't be renewed. Different narrative shapes (exfiltration,
+unauthorized-access, sabotage/evidence-destruction), each with 5-7
+artefacts spanning all four kinds.
+
+This is also a first, partial step against week 4's "only one spec
+family has real coverage" limitation - each storyline's `base_spec` is
+deliberately *not* SSH-pentesting phrasing (a corporate workstation, an
+internal file server, a dev VM with a shared repo). Checked rather than
+assumed whether this actually broadened coverage: it doesn't, not yet.
+Every generated scenario role still comes back SSH-flavoured (install
+openssh-server, manage sshd, sometimes a deliberately weak credential)
+regardless of the storyline's own framing, because the RAG corpus
+(`knowledge/`) is still SSH/sshd_config-focused - retrieval surfaces what
+the corpus has, not what the spec asks for in different words. Real
+breadth needs broader corpus content, which is real work for a future
+week, not something phrasing alone was ever going to solve - recorded
+honestly here rather than claimed as progress it isn't.
+
+### Evaluation across the scenario set
+
+`report.py`'s `aggregate_reports()` gained two additions for this: a
+per-run `test_deploy_artefacts_verified` rate (parallel to the existing
+`test_deploy_config_verified`, `None` on runs with no storyline so plain
+curriculum-VM runs don't drag it down), and a per-*check* (not per-run)
+`artefact_checks` breakdown - total artefact checks across every run,
+how many matched, and how many were specifically attributed to `"changed"`
+(planted by that run) rather than merely present. The per-check
+breakdown matters once there's more than a couple of forensic runs:
+"did every artefact in this one run verify" and "how reliably does
+artefact planting work overall" are different questions, and only the
+second one is a meaningful number to report with a small sample size.
+
 ## Libraries and tools
 
 - **FastAPI** — the HTTP interface (`POST /generate`). Chosen over Flask
@@ -946,6 +1178,20 @@ of this week are also flagged as code-complete-but-not-live-tested below.
   invoked via `wsl_bridge.run_posix_tool()`, installed inside WSL locally
   or in the CI runner's own environment, never imported by this Windows
   venv — see the week 4 Windows/POSIX section above for why.
+- **Faker** — synthetic evidence content for the forensic scenarios
+  (`forensics/generators.py`): names, emails, IPs, filenames, timestamps.
+  Already justified in the project's research tracker as the reason the
+  forensic track doesn't need ethics approval (synthetic-only data); no
+  new justification needed here beyond confirming the actual usage
+  matches that justification, which `generators.py`'s own module
+  docstring exists to keep true.
+- **libguestfs** — investigated, not adopted. See the week 5
+  libguestfs-vs-Ansible section above for the full reasoning (KVM
+  acceleration is available in WSL2 on this machine, which was the
+  promising finding, but the VHDX lifecycle mismatch and the fact that
+  every planned artefact type is achievable from inside the guest
+  outweighed it). Not installed, not a dependency; recorded here so a
+  future revisit doesn't have to re-derive the same investigation.
 
 Outside Python: **Packer** and **Vagrant** (HashiCorp CLI tools) generate
 and boot the VM — `packer/ubuntu-base.pkr.hcl` and the generated per-run
@@ -953,7 +1199,8 @@ and boot the VM — `packer/ubuntu-base.pkr.hcl` and the generated per-run
 project uses **Hyper-V** on the dev machine (week 3), with **VirtualBox**
 still what the (unwired) Packer template targets (`virtualbox-iso`
 builder) — a known mismatch, noted in the week 3 section, that matters
-once the Packer box is actually wired in. **Docker** is what CI's Molecule
+once the Packer box is actually wired in (still not wired in as of week
+5 — see Known limitations below). **Docker** is what CI's Molecule
 scenario uses (hosted runners support it natively); **WSL2** is what
 `ansible-lint`/Molecule run inside of locally, on Windows.
 

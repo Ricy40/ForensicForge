@@ -4,6 +4,8 @@ from pathlib import Path
 import click
 
 from . import config
+from .forensics import derive_checks_from_storyline, provision_storyline
+from .forensics.scenarios import ALL_SCENARIOS
 from .provision import AnsibleParseError, provision_spec
 from .service import generate_vm_spec
 from .validate import (
@@ -67,6 +69,48 @@ def provision(spec: str) -> None:
     click.echo(f"  forensicforge test-deploy {result.run_dir}")
 
 
+@main.command(name="forensic-scenario")
+@click.argument("scenario_id", required=False)
+def forensic_scenario_cmd(scenario_id: str | None) -> None:
+    """Provision a forensic storyline: a curriculum VM plus planted synthetic evidence.
+
+    Run with no SCENARIO_ID to list the available storylines. Writes the
+    same role/Vagrantfile/Molecule scenario `provision` does, plus a
+    second "forensic_artefacts" role that plants the storyline's evidence
+    - see docs/METHODOLOGY.md (week 5). Verify with:
+    `test-deploy --storyline SCENARIO_ID`.
+    """
+    if not scenario_id:
+        click.echo("Available forensic scenarios:")
+        for sid, storyline in ALL_SCENARIOS.items():
+            click.echo(f"  {sid}")
+            click.echo(f"      {storyline.title}")
+        return
+
+    storyline = ALL_SCENARIOS.get(scenario_id)
+    if storyline is None:
+        click.echo(f"Unknown scenario: {scenario_id!r}. Run with no argument to list available scenarios.", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{storyline.title}\n  {storyline.narrative}\n")
+    try:
+        result = provision_storyline(storyline)
+    except AnsibleParseError as exc:
+        click.echo(f"Failed to parse LLM output into a valid Ansible role: {exc}", err=True)
+        click.echo("\n--- Raw LLM output ---\n", err=True)
+        click.echo(exc.raw_output, err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Wrote run '{result.provision.run_id}' to: {result.provision.run_dir}")
+    click.echo(f"  Scenario role:  {result.provision.role_dir}")
+    click.echo(f"  Artefact role:  {result.artefact_role_dir}")
+    click.echo(f"  ({len(storyline.artefacts)} artefact(s) planted)")
+    click.echo()
+    click.echo("Next:")
+    click.echo(f"  forensicforge validate {result.provision.run_dir}")
+    click.echo(f"  forensicforge test-deploy {result.provision.run_dir} --storyline {scenario_id}")
+
+
 @main.command()
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--role-name", default="training_vm", help="Role name within run_dir/roles/.")
@@ -90,15 +134,28 @@ def validate(run_dir: Path, role_name: str) -> None:
 @main.command(name="test-deploy")
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--role-name", default="training_vm", help="Role name within run_dir/roles/.")
-def test_deploy_cmd(run_dir: Path, role_name: str) -> None:
+@click.option(
+    "--storyline", "scenario_id", default=None,
+    help="Forensic scenario id (see `forensic-scenario` with no argument) to also verify planted evidence for.",
+)
+def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None) -> None:
     """Boot the generated VM, verify its config, then destroy it - automatically.
 
     Replaces the manual `vagrant up` workflow from week 3. Requires an
     elevated terminal on this machine (Hyper-V provider requirement) - see
-    docs/METHODOLOGY.md. Updates/creates report.json in RUN_DIR.
+    docs/METHODOLOGY.md. Updates/creates report.json in RUN_DIR. Pass
+    --storyline to also verify a forensic scenario's planted evidence
+    (must match whatever `forensic-scenario` was run for this RUN_DIR).
     """
     role_dir = run_dir / "roles" / role_name
     checks = derive_checks_from_role(role_dir)
+
+    if scenario_id:
+        storyline = ALL_SCENARIOS.get(scenario_id)
+        if storyline is None:
+            click.echo(f"Unknown scenario: {scenario_id!r}.", err=True)
+            raise SystemExit(1)
+        checks = checks + derive_checks_from_storyline(storyline)
 
     if not checks:
         click.echo("No lineinfile-based checks could be derived from this role; nothing to verify.", err=True)
@@ -106,12 +163,20 @@ def test_deploy_cmd(run_dir: Path, role_name: str) -> None:
     click.echo(f"Booting {run_dir} (provider: {config.VAGRANT_PROVIDER}) ...")
     result = run_test_deploy(run_dir, checks)
 
-    click.echo(f"  booted:          {result.booted}")
-    click.echo(f"  config_verified: {result.config_verified}")
-    click.echo(f"  destroyed:       {result.destroyed}")
+    click.echo(f"  booted:            {result.booted}")
+    click.echo(f"  config_verified:   {result.config_verified}")
+    if scenario_id:
+        click.echo(f"  artefacts_verified: {result.artefacts_verified}")
+    click.echo(f"  destroyed:         {result.destroyed}")
     for check in result.checks:
         mark = "PASS" if check.matched else "FAIL"
-        click.echo(f"  [{mark}] {check.command}")
+        attribution = {
+            "changed": "applied by this run",
+            "ok": "already true before this run - NOT attributable",
+            None: "attribution unknown (task not found in provisioner output)",
+        }.get(check.attribution, f"task {check.attribution}")
+        tag = "artefact" if check.category == "artefact" else "config"
+        click.echo(f"  [{mark}] ({tag}) {check.command}  ({attribution})")
     if result.error:
         click.echo(f"  error: {result.error}", err=True)
 

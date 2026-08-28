@@ -1,12 +1,13 @@
 import json
 import subprocess
+import sys
 
 import pytest
 
 from forensicforge.validate.hcl_check import validate_packer_template
 from forensicforge.validate.report import aggregate_reports, load_report, write_report
 from forensicforge.validate.scanners import run_ansible_lint, run_checkov
-from forensicforge.validate.test_deploy import derive_checks_from_role
+from forensicforge.validate.test_deploy import derive_checks_from_role, parse_task_attribution
 from forensicforge.validate.wsl_bridge import WslUnavailableError
 
 VALID_PACKER = """\
@@ -168,13 +169,80 @@ def test_derive_checks_from_role_extracts_lineinfile_tasks(tmp_path):
 
     checks = derive_checks_from_role(role_dir)
 
-    assert checks == [("sudo grep -F -- 'PermitRootLogin yes' /etc/ssh/sshd_config", "PermitRootLogin yes")]
+    assert len(checks) == 1
+    assert checks[0].command == "sudo grep -F -- 'PermitRootLogin yes' /etc/ssh/sshd_config"
+    assert checks[0].expected == "PermitRootLogin yes"
+    assert checks[0].task_name == "Allow root login (for pentesting exercise)"
 
 
 def test_derive_checks_from_role_returns_empty_for_no_lineinfile_tasks(tmp_path):
     role_dir = _write_role_tasks(tmp_path, BENIGN_TASK)
 
     assert derive_checks_from_role(role_dir) == []
+
+
+# --- test_deploy.py: parse_task_attribution (native, no VM needed) ---
+
+CHANGED_TASK_LOG = """\
+TASK [training_vm : Allow root login (for pentesting exercise)] **************
+changed: [default]
+
+TASK [training_vm : Install OpenSSH server] ***********************************
+ok: [default]
+"""
+
+
+def test_parse_task_attribution_reads_changed_and_ok():
+    attribution = parse_task_attribution(CHANGED_TASK_LOG)
+
+    assert attribution == {
+        "training_vm : Allow root login (for pentesting exercise)": "changed",
+        "training_vm : Install OpenSSH server": "ok",
+    }
+
+
+def test_parse_task_attribution_empty_for_no_task_headers():
+    assert parse_task_attribution("just some unrelated log text\nwith no TASK headers\n") == {}
+
+
+def test_test_deploy_attribution_lookup_matches_role_prefixed_task_name(tmp_path, monkeypatch):
+    """Full test_deploy() flow with vagrant mocked, checking attribution wiring end-to-end.
+
+    Imports the test_deploy *module* via sys.modules rather than
+    `import forensicforge.validate.test_deploy as td`: the package's
+    __init__.py does `from .test_deploy import test_deploy` (the
+    function), which rebinds the `test_deploy` attribute on the
+    `forensicforge.validate` package to the function, shadowing the
+    submodule of the same name for ordinary dotted-attribute access.
+    sys.modules is unaffected by that and always holds the real module.
+    """
+    td = sys.modules["forensicforge.validate.test_deploy"]
+
+    role_dir = _write_role_tasks(tmp_path, LINEINFILE_TASKS)
+    checks = td.derive_checks_from_role(role_dir)
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            self._out_cm = out_cm
+            with out_cm() as fh:
+                fh.write(CHANGED_TASK_LOG)
+
+        def up(self, provider=None, provision=None):
+            pass
+
+        def ssh(self, command):
+            return "PermitRootLogin yes\n"
+
+        def destroy(self):
+            pass
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    result = td.test_deploy(tmp_path, checks)
+
+    assert result.booted is True
+    assert result.config_verified is True
+    assert result.checks[0].attribution == "changed"
 
 
 # --- report.py ---

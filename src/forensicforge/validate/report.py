@@ -88,4 +88,38 @@ def aggregate_reports(generated_dir: Path = config.GENERATED_DIR) -> dict:
         "test_deploy_config_verified": _rate(
             lambda r: (r.get("test_deploy") or {}).get("config_verified")
         ),
+        # Per-run: did every artefact in a forensic run's storyline verify.
+        # None on runs with no storyline (not just "no" - see
+        # TestDeployResult.artefacts_verified), so plain curriculum-VM
+        # runs don't drag this rate down.
+        "test_deploy_artefacts_verified": _rate(
+            lambda r: (r.get("test_deploy") or {}).get("artefacts_verified")
+        ),
+        # Per-check, not per-run: how reliably individual pieces of
+        # planted evidence verify and are attributable to the run that
+        # planted them, across every forensic scenario run so far. Finer
+        # grained than the per-run rate above once there's more than a
+        # couple of forensic runs - "every artefact in this run verified"
+        # and "how reliably does artefact planting work overall" are
+        # different questions. See docs/METHODOLOGY.md (week 5).
+        "artefact_checks": _artefact_check_stats(reports),
+    }
+
+
+def _artefact_check_stats(reports: list[dict]) -> dict:
+    all_checks = [
+        check
+        for report in reports
+        for check in ((report.get("test_deploy") or {}).get("checks") or [])
+        if check.get("category") == "artefact"
+    ]
+    total = len(all_checks)
+    matched = sum(1 for c in all_checks if c.get("matched"))
+    attributed = sum(1 for c in all_checks if c.get("attribution") == "changed")
+    return {
+        "total_checks": total,
+        "matched": matched,
+        "match_rate": (matched / total) if total else None,
+        "attributed_to_this_run": attributed,
+        "attribution_rate": (attributed / total) if total else None,
     }
