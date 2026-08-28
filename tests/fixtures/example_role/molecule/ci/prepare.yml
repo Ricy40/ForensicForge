@@ -1,0 +1,15 @@
+# Refreshes the container's apt cache before the role runs - not part of
+# the fixture role itself (which stays a faithful, unmodified copy of a
+# real generated run), since a real Vagrant-booted VM's box image is
+# fresher than this Docker base image's baked-in package index and has
+# never needed this. Confirmed by actually running this job: without it,
+# "Install OpenSSH server" fails with "No package matching 'openssh-server'
+# is available." Molecule already calls prepare.yml as its own dedicated
+# step for exactly this kind of environment setup, if present.
+- name: Prepare
+  hosts: all
+  become: true
+  tasks:
+    - name: Refresh apt package cache
+      ansible.builtin.apt:
+        update_cache: true
