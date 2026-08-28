@@ -1196,6 +1196,133 @@ breadth needs broader corpus content, which is real work for a future
 week, not something phrasing alone was ever going to solve - recorded
 honestly here rather than claimed as progress it isn't.
 
+### Debugging test-deploy for real: what live Hyper-V boots actually surfaced
+
+Getting from "code that should work" to real `test-deploy` runs against
+all the week's scenarios took far more debugging than the feature list
+above suggests, and surfaced a genuinely long chain of real, previously-
+invisible bugs - none catchable by unit tests (which mock the WSL/vagrant
+boundary deliberately, for a fast hermetic suite) or by anything short of
+an actual elevated-terminal boot on this actual machine. Recorded here in
+full because each one is a real, reproducible finding, not a guess:
+
+1. **`vagrant up` on Hyper-V hung forever**, waiting on an interactive
+   "What switch would you like to use?" prompt `test_deploy()` can never
+   answer (no stdin fed to it). First fix attempt was wrong: a
+   `config.vm.provider "hyperv" do |h| h.vmswitch = ... end` block, which
+   Vagrant rejected outright ("The following settings shouldn't exist:
+   vmswitch") - checked against Vagrant's actual `config.rb` on GitHub
+   afterward and confirmed no such attribute exists at all, despite
+   several online guides implying otherwise. The real mechanism, found by
+   reading the Hyper-V provider's `configure.rb` action directly: a
+   `config.vm.network "public_network", bridge: "<switch name>"` entry -
+   ordinary Vagrant networking config, not a Hyper-V-specific setting.
+2. **The shell provisioner that creates the upload directory defaults to
+   running as root**, so the *next* provisioner's SCP upload (as the
+   plain `vagrant` user) failed with a permissions error writing into it.
+   `privileged: false` fixed it. This had been silently masked until this
+   week: Vagrant's own "already provisioned, skip" default meant it had
+   never actually re-run this step on a machine reused from an earlier
+   manual boot, until `provision=True` (closing the attribution gap)
+   started forcing every `test-deploy` to reprovision from scratch.
+3. **`test_deploy()` only ever called `destroy()` if `up()` succeeded** -
+   found by hitting exactly the failure mode it caused: a provisioner
+   step failed partway through `up()` (after the VM already existed), the
+   function returned early, and the VM was left running with a lock that
+   then blocked every subsequent attempt against the same run directory.
+   Restructured so `destroy()` always runs via `finally`, regardless of
+   where or whether `up()` failed. A regression test
+   (`test_test_deploy_destroys_even_when_up_fails`) locks this in.
+4. **`ansible.builtin.copy`/`lineinfile` don't create missing parent
+   directories.** A `deleted_file` artefact targeting
+   `/home/vagrant/Documents/clients/export.csv` failed outright
+   ("Destination directory ... does not exist") because nothing else in
+   the role had created `Documents/clients/`. Fixed with a shared
+   `_ensure_dir_task()` helper, applied uniformly to every file-writing
+   artefact kind - not just the one that happened to need it for today's
+   demo scenarios, since a future storyline could easily target an
+   equally unlikely path.
+5. **A storyline artefact deleted evidence from other artefacts in the
+   same playbook run.** `shell_command_history_clear()` originally
+   generated `history -c && rm -f ~/.bash_history` - narratively an
+   attempt to cover tracks, but literally correct: it deleted the exact
+   file two earlier artefacts (the `tar`/`scp` commands) had just
+   written their evidence into, in the same run. Confirmed precisely by
+   the failure pattern: every check for a line written *before* this
+   task failed, everything written after (nothing, in this case) or
+   verified independently of it passed. Fixed to `history -c` alone -
+   which is also more forensically realistic (actually deleting the file
+   outright is a far more conspicuous move than just clearing the
+   in-memory session history).
+6. **The guest sometimes received stale content on `roles/`, not what
+   was currently on disk.** A rerun on a genuinely fresh VM (confirmed
+   via "Importing a Hyper-V instance" in the log, not a resumed one)
+   still ran an older version of a role than what the host filesystem
+   had at the time of `vagrant up` - no confirmed root cause, but
+   Vagrant's directory-copy file provisioner is the only thing between
+   "what's on disk here" and "what the guest sees", so the fix was
+   forcing a clean destination (`rm -rf roles` before every copy) rather
+   than requiring the mechanism to be pinned down first.
+7. **A `validate` run after `test-deploy` silently destroyed the
+   `test_deploy` section of `report.json`.** `build_validation_report()`
+   always sets `test_deploy: None` (it never boots anything), and the CLI
+   wrote that dict out wholesale rather than merging it into whatever was
+   already there - confirmed by finding real, already-recorded
+   `test_deploy` data replaced with `null` after a routine re-validate.
+   Fixed to load and preserve the existing `test_deploy` section first
+   (`test-deploy` itself already did the equivalent for its own writes;
+   `validate` needed the same). The already-lost data for the runs
+   affected was reconstructed from the exact terminal transcripts of
+   those runs (verbatim commands, matched/attribution results; `output`
+   approximated as the expected value on a match or empty on a miss,
+   since the raw grep text itself wasn't part of the transcript) rather
+   than re-run from scratch at real Hyper-V-boot cost - each
+   reconstructed `report.json` carries an explicit note saying so.
+
+### The one finding left genuinely unresolved: some files won't hold evidence
+
+One more anomaly survived two separate, real fix attempts and is
+recorded here as an honest, characterized-but-not-root-caused limitation
+rather than something forced to look solved. Across every live run:
+writes to `/var/log/auth.log` and to the *actively SSH-connected* user's
+(`vagrant`'s) `.bash_history` were never reliably verifiable, no matter
+how they were written - while writes to every other target (a
+`become`-only user's `.bash_history`, deleted files, backdated
+timestamps, email drafts) verified correctly, every time, across all
+three scenarios.
+
+Two fix attempts were made before concluding this needs a different kind
+of investigation than another live-boot cycle:
+
+- Consolidating the three `.bash_history` writes for one storyline into
+  a single atomic `blockinfile` task, on the theory that sequential
+  separate writes were each getting clobbered by something running
+  between them. This didn't hold up: even as one atomic write, two of
+  the three lines were still missing at verification time while the
+  third (coincidentally-plausible `history -c`) was still there - ruling
+  out "multiple separate writes" as the mechanism, since an atomic write
+  either all persists or it doesn't.
+- The leading hypothesis that remains: the *live* SSH session Ansible/
+  Vagrant itself uses is logged in as `vagrant` for every task, and
+  something in that session's own shell/login mechanics (rather than
+  anything in this project's own tasks) is what's touching
+  `vagrant`'s `.bash_history` between tasks - never confirmed against the
+  actual guest, since doing so needs a boot cycle kept alive specifically
+  to inspect it before destroy runs, which wasn't attempted this week.
+  `/var/log/auth.log` doesn't fit that theory directly (it isn't a shell
+  history file), so if there is one root cause, it isn't this one; if
+  there are two separate causes, this is a hypothesis for one of them.
+
+Chasing this further would have meant more 5+ minute live-boot cycles
+against an uncertain payoff - the "don't gold-plate" instruction that
+already applied to the CI systemd investigation applies here too.
+Documented as real, reproducible, evaluation-relevant data instead: two
+specific artefact target types are currently unreliable for verification
+on this provider/box combination, everything else is not. A concrete,
+actionable takeaway for future storyline design either way: prefer
+target paths outside actively-managed system files (a project-owned log,
+a non-primary user's history) until this is better understood.
+
 ### Evaluation across the scenario set
 
 `report.py`'s `aggregate_reports()` gained two additions for this: a
@@ -1209,6 +1336,40 @@ breakdown matters once there's more than a couple of forensic runs:
 "did every artefact in this one run verify" and "how reliably does
 artefact planting work overall" are different questions, and only the
 second one is a meaningful number to report with a small sample size.
+
+The first real dataset, across all 5 runs so far (1 SSH-pentesting run
+from week 3, 3 forensic storylines, and 1 discarded re-roll of the
+sabotage storyline kept only for its static-scan data - see the corpus-
+coverage discussion above):
+
+```
+total_runs: 5
+checkov:                      5/5 passed  (1.0)
+ansible_lint:                 3/5 passed  (0.6)
+molecule:                     0/5 passed  (0.0)  - local elevation/environment, see below
+test_deploy_booted:           3/4 applicable  (0.75)
+test_deploy_config_verified:  2/2 applicable  (1.0)
+test_deploy_artefacts_verified: 0/2 applicable  (0.0)
+artefact_checks:  12 total, 8 matched (0.667), 12/12 attributed to their run (1.0)
+```
+
+Reading this honestly rather than as a scorecard: checkov's 100% and
+ansible-lint's 60% both mean what the week 4/5 sections above say they
+mean (checkov mostly has nothing applicable to check; ansible-lint's two
+failures are both genuine, one of them the same `generic/ubuntu2004`-vs-
+"ubuntu"-user issue documented below). Molecule's 0% is this session's
+own elevation/Hyper-V constraints, not a role-quality signal. The
+`test_deploy` numbers are the interesting ones: booting succeeded 3 times
+out of 4 attempts (the failure is the corpus-gap "ubuntu" user issue,
+a real content problem, not infrastructure), config verification was
+perfect on the runs that had config checks to verify, and - the number
+that matters most for this week's actual point - **every single one of
+the 12 artefact-planting tasks across both completed forensic runs was
+correctly attributed as `"changed"`: the tooling never once failed to
+notice that its own tasks had actually run.** The gap is entirely in the
+*separate* question of whether that state was still observable moments
+later (8/12, for the reasons above), which is exactly the distinction
+attribution was built to make visible rather than blur together.
 
 ## Libraries and tools
 
@@ -1301,11 +1462,20 @@ once the Packer box is actually wired in (still not wired in as of week
 scenario uses (hosted runners support it natively); **WSL2** is what
 `ansible-lint`/Molecule run inside of locally, on Windows.
 
-## Known limitations going into week 5
+## Known limitations going into week 6
 
 - The knowledge corpus covers the SSH pentesting example thoroughly but not
-  other scenario families yet; coverage should be revisited as new spec
-  types are exercised.
+  other scenario families yet. Week 5 made this concrete rather than
+  theoretical: varying a forensic storyline's `base_spec` wording (a
+  corporate workstation, an internal file server, a dev VM with a shared
+  repo) did not broaden what actually got generated - roles still came
+  back SSH-flavoured regardless, and the one storyline whose spec strayed
+  furthest from SSH-pentesting territory ("development VM with a shared
+  project repository") produced content that didn't survive a live boot
+  at all (an assumed-but-nonexistent "ubuntu" user; on a re-roll, an
+  undefined Jinja2 variable and a fabricated GitHub URL). Real breadth
+  needs broader corpus content - a future week's work, not something
+  phrasing alone was ever going to solve.
 - There is no cache-invalidation check between `knowledge/` and the
   persisted `.chroma/` store — edits to the corpus require deleting
   `.chroma/` by hand.
@@ -1314,58 +1484,64 @@ scenario uses (hosted runners support it natively); **WSL2** is what
   an actual evaluation metric is deferred to the dissertation's evaluation
   chapter.
 - `packer/ubuntu-base.pkr.hcl` has not been built or verified and is not
-  wired into the Vagrantfiles `provision` generates, and now specifically
+  wired into the Vagrantfiles `provision` generates, and still specifically
   targets the wrong provider for this machine's actual Vagrant setup
-  (VirtualBox vs. Hyper-V) — see the Packer-vs-stock-box and week 4
-  Packer-provider sections above.
-- Only one Ansible role per run is supported (a single `role_name`), and
-  the role is provisioned into `all` hosts in `playbook.yml` — fine for a
-  single-VM-per-spec scenario, which is all the pipeline produces so far.
+  (VirtualBox vs. Hyper-V) — flagged again this week (the brief's own
+  "loose end, not this week's job") since it remains true; see the
+  Packer-vs-stock-box and week 4 Packer-provider sections above.
+- Only one Ansible role per run is supported for the *scenario* role (a
+  single `role_name`) - the forensic track's `forensic_artefacts` role
+  (week 5) is a deliberate, additional exception to this, not a general
+  multi-role capability.
 - Checkov's Ansible framework covers 6 built-in checks, none of which
   match the modules this project's generated roles actually use — a
   `passed: true` from Checkov in `report.json` currently means "nothing
   applicable was found to check," not "this role was verified secure."
-  See the week 4 section above for the full reasoning and what would
-  actually be needed to close it (broader custom checks, or leaning more
-  on `ansible-lint`).
-- The specific failure mode that motivated week 4 (a claimed change not
-  actually attributable to the generated role, because the base image
-  already had it) is not fully closed. `test_deploy.py` verifies *end
-  state* automatically now, which is strictly more than week 3 had, but
-  distinguishing "the role caused this" from "this was already true"
-  would need capturing Ansible's own per-task `changed` status during
-  the converge run, which was not built this week — see the week 4
-  section above.
-- `ansible-lint` runs live against the real week-3 role as of this week
-  and correctly found a genuine issue (`meta/main.yml` missing the
-  `license` field `galaxy_info` requires) — see the "After the reboot"
-  section above. Molecule runs live through `destroy`/`syntax` (proving
-  the `vagrant` module and role resolution both work) and correctly
-  generates a Hyper-V Vagrantfile, but the actual `create` step (booting
-  a VM) remains unverified end-to-end — see below. The Linux-native code
-  path (what CI actually uses) is still exercised only by unit tests with
-  a mocked subprocess call, not a real CI run — `.github/workflows/validate.yml`
-  has not been pushed and run.
-- Neither `test-deploy` nor a full live `molecule test` has completed an
-  actual VM boot this week. Both need the same elevated terminal `vagrant
-  up` needed in week 3 (confirmed by deliberately reproducing the
-  failure, which now surfaces a real, readable error rather than the
-  generic one - see the python-vagrant section above), and Molecule's
-  attempt additionally ran into three VMs on this machine stuck
-  `<inaccessible>` in VirtualBox (the same Memory Integrity conflict
-  documented in week 3), which needed manual cleanup for VMs this
-  session's own testing created and were left alone for three of unknown
-  origin. Completing either requires the user's own elevated terminal,
-  per the project's established pattern of not running `vagrant`
-  operations unattended.
-- Vagrant's own state can go stale in ways this project's code doesn't
-  clean up: Molecule's ephemeral directory name is derived from the
-  role's own directory name (not the full per-run path), so repeated
-  `molecule`/`test-deploy` attempts using the same default role name
-  (`training_vm`) can leave Vagrant's global machine index
-  (`~/.vagrant.d/data/machine-index/index` on Windows) or VirtualBox's own
-  registry pointing at machines from an earlier, differently-configured
-  attempt. `molecule test`'s own `destroy` step cleans up within its
-  current ephemeral directory but not this global bookkeeping. Not fixed
-  this week - a real operational gap for any future automated/repeated
-  test-deploy runs, worth revisiting if it recurs.
+  Still true of the forensic artefact roles too, confirmed this week
+  (checkov passes them for the same "nothing applicable" reason). See
+  the week 4 section for the full reasoning.
+- **Attribution is closed for `test_deploy.py`**, both the scenario
+  role's own config checks and (new this week) forensic artefact checks -
+  see the week 5 section above. Not closed: whether the *end state a
+  check observes* is itself reliably persistent for every kind of target.
+  Two specific target types (`/var/log/auth.log`, and the actively
+  SSH-connected user's `.bash_history`) were found this week to not
+  reliably hold written content through to verification time, for
+  reasons not fully root-caused - see the dedicated section above. Every
+  planting *task* was still correctly attributed as having run
+  (12/12 this week's data) - the gap is specifically in end-state
+  persistence for those two target types, not in the attribution
+  mechanism itself.
+- CI (`.github/workflows/validate.yml`) is pushed, has actually run, and
+  both jobs pass as of this week - closing the limitation carried over
+  from week 4. Getting there took five real, distinct bugs (missing
+  `ansible-lint` install, a Python-version mismatch in the Docker image,
+  an `ansible-lint` scope bug that was silently dropping real findings
+  even locally, a systemd-in-Docker setup issue, and a stale apt cache) -
+  see the dedicated CI section above for the full account.
+- `test-deploy` has now completed real, successful end-to-end runs (boot,
+  verify, destroy) for both the original SSH-pentesting scenario and two
+  of the three forensic storylines - closing the "never completed an
+  actual VM boot" limitation from week 4. Getting there surfaced six more
+  real bugs specific to live Hyper-V boots (the switch-selection hang, a
+  privileged-shell-provisioner ownership bug, `test_deploy()` not always
+  destroying, missing parent directories for artefacts, a self-destructive
+  artefact, and a stale file-copy issue) - see the dedicated section
+  above. One forensic scenario (`sabotage-before-offboarding`) never
+  completed a boot at all, for a genuine LLM-content reason (the corpus-
+  gap finding above), not an infrastructure one.
+- Vagrant's own state can still go stale in ways this project's code
+  doesn't fully clean up: a `vagrant up` interrupted mid-way (a Ctrl+C,
+  say) can leave a lock that blocks the next attempt against the same
+  run directory, needing a manual `vagrant destroy -f` to clear - `test_deploy()`
+  destroying more reliably now (see above) narrows this window
+  considerably but doesn't eliminate the case of the process itself being
+  killed before `finally` can run. Molecule's ephemeral directory naming
+  (derived from the role's own directory name, not the full per-run path)
+  is a related, separate gap, not fixed this week - a real operational
+  consideration for any future automated/repeated test-deploy runs.
+- `forensicforge validate`, run a second time after `test-deploy`, used to
+  silently destroy the recorded `test_deploy` results (fixed this week -
+  see the dedicated bug list above) - flagged here as a reminder that the
+  fix is new and not yet exercised across many repeated validate/test-deploy
+  cycles in sequence.

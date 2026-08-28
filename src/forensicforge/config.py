@@ -38,6 +38,14 @@ VAGRANT_BOX = os.environ.get("FORENSICFORGE_VAGRANT_BOX", "generic/ubuntu2004")
 # rather than VirtualBox on this machine specifically.
 VAGRANT_PROVIDER = os.environ.get("FORENSICFORGE_VAGRANT_PROVIDER", "hyperv")
 
+# Hyper-V virtual switch the generated Vagrantfile attaches to. Without
+# this set explicitly, `vagrant up` prompts interactively ("What switch
+# would you like to use?") whenever more than one switch exists - which
+# test_deploy() can never answer (no stdin is fed to it), so it just
+# hangs forever. "Default Switch" is the NAT switch Windows creates
+# automatically when Hyper-V is enabled - see docs/METHODOLOGY.md (week 5).
+VAGRANT_HYPERV_SWITCH = os.environ.get("FORENSICFORGE_VAGRANT_HYPERV_SWITCH", "Default Switch")
+
 # ansible-lint and Molecule depend on ansible-core, which needs POSIX-only
 # stdlib modules (grp, fcntl) not present on Windows. Both are invoked
 # through WSL instead of the local venv - see docs/METHODOLOGY.md (week 4)

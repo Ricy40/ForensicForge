@@ -174,22 +174,33 @@ def test_deploy(
     result = TestDeployResult(booted=False, destroyed=False, config_verified=None)
 
     try:
-        # provision=True forces Ansible to actually run every time, rather
-        # than Vagrant's own "machine already provisioned, skipping"
-        # default - confirmed by finding exactly that message in an
-        # earlier run's vagrant.log. Without this, a machine left over
-        # from an earlier attempt could report checks passing without
-        # this run's role having done anything at all - the general form
-        # of the same attribution problem this feature closes.
-        v.up(provider=provider, provision=True)
-        result.booted = True
-    except subprocess.CalledProcessError:
-        result.error = f"vagrant up failed - see {log_path}:\n{_tail(log_path)}"
-        return result
+        try:
+            # provision=True forces Ansible to actually run every time,
+            # rather than Vagrant's own "machine already provisioned,
+            # skipping" default - confirmed by finding exactly that
+            # message in an earlier run's vagrant.log. Without this, a
+            # machine left over from an earlier attempt could report
+            # checks passing without this run's role having done
+            # anything at all - the general form of the same attribution
+            # problem this feature closes.
+            v.up(provider=provider, provision=True)
+            result.booted = True
+        except subprocess.CalledProcessError:
+            result.error = f"vagrant up failed - see {log_path}:\n{_tail(log_path)}"
+            # This `return` skips straight to `finally` below, which
+            # still runs `destroy()` regardless - `up` can fail after a
+            # VM was already created (a provisioner step failing partway
+            # through, as opposed to the VM never coming up at all), and
+            # the previous version of this function only reached destroy
+            # if `up` succeeded, so a mid-`up` failure left a real VM
+            # behind with a lock that then blocked every retry. Confirmed
+            # by hitting exactly this: a provisioner permissions error
+            # failed `up` after the VM had already booted. See
+            # docs/METHODOLOGY.md (week 5).
+            return result
 
-    attribution = parse_task_attribution(_read_log(log_path))
+        attribution = parse_task_attribution(_read_log(log_path))
 
-    try:
         for check in checks:
             try:
                 output = v.ssh(command=check.command)

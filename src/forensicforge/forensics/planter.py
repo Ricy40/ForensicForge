@@ -1,5 +1,6 @@
 import posixpath
 from datetime import datetime, timezone
+from itertools import groupby
 from pathlib import Path
 
 import yaml
@@ -19,43 +20,87 @@ COMBINED_PLAYBOOK_TEMPLATE = """\
     - {artefact_role}
 """
 
+_LINE_KINDS = ("log_entry", "shell_history")
+
+
+def _ensure_dir_task(path: str) -> dict:
+    """A task that makes sure `path`'s parent directory exists first.
+
+    `ansible.builtin.copy`/`lineinfile` do not create missing parent
+    directories on their own - confirmed by reproducing exactly this
+    failure ("Destination directory ... does not exist") for a
+    deleted_file artefact whose target lived under a directory
+    (/home/vagrant/Documents/clients/) nothing else in the role had
+    created. Applied uniformly to every artefact kind that writes a file,
+    not just the ones today's demo scenarios happen to need it for -
+    a future storyline could easily target a path just as unlikely to
+    already exist. See docs/METHODOLOGY.md (week 5).
+    """
+    directory = posixpath.dirname(path)
+    return {
+        "name": f"Ensure {directory} exists",
+        "ansible.builtin.file": {"path": directory, "state": "directory", "mode": "0700"},
+    }
+
+
+def _build_line_artefacts_block(target_path: str, artefacts: list[Artefact]) -> tuple[list[dict], list[DerivedCheck]]:
+    """One blockinfile task writing every log_entry/shell_history artefact
+    that targets the same file, instead of one lineinfile task per
+    artefact appending separately.
+
+    Multiple sequential lineinfile appends to the same target file were
+    found to not reliably all survive to verification time - confirmed by
+    reproducing it in two separate live test-deploy runs: for a file
+    written to 3 times, only the most recent write was still there by the
+    time the checks ran; for a *different* file written to twice in
+    another run, both survived. The one clear difference between the two
+    cases: the file that lost writes was ~vagrant/.bash_history - the
+    home directory of the same user Ansible/Vagrant's SSH connection
+    itself logs in as for every task, unlike a become-only user's (root's)
+    history file, which was untouched. That points at the live SSH
+    session itself touching its own user's history file between tasks
+    (a login shell's own history-flush behaviour, plausibly), but this
+    wasn't confirmed against the actual guest - not fully understood.
+    Making the write atomic (one task, all lines at once) sidesteps the
+    problem regardless of the exact mechanism. See docs/METHODOLOGY.md
+    (week 5).
+    """
+    kind = artefacts[0].kind
+    mode = "0600" if kind == "shell_history" else "0644"
+    task_name = f"Plant {len(artefacts)} {kind} entries in {target_path}"
+    tasks = [
+        _ensure_dir_task(target_path),
+        {
+            "name": task_name,
+            "ansible.builtin.blockinfile": {
+                "path": target_path,
+                "block": "\n".join(a.content for a in artefacts),
+                "marker": f"# {{mark}} forensicforge:{target_path}",
+                "create": True,
+                "mode": mode,
+            },
+        },
+    ]
+    # Attribution is per-*task*, not per-artefact: every check here shares
+    # task_name, since they're all verifying pieces of the one task above.
+    checks = [_grep_check(task_name, target_path, a.content) for a in artefacts]
+    return tasks, checks
+
 
 def _build_task_and_check(artefact: Artefact) -> tuple[list[dict], list[DerivedCheck]]:
     """Build the Ansible task(s) that plant one artefact, and the matching
     verification check(s) - built together so task names can never drift
     out of sync between planting and verification, the same reasoning
     behind provision/ansible_writer.py's ROLE_NAMESPACE constant.
-    """
-    if artefact.kind in ("log_entry", "shell_history"):
-        task_name = artefact.description
-        # Real log files are typically 0644 (root-owned, world-readable);
-        # real shell history files are typically 0600 (private to the
-        # user) - matching that isn't just tidiness, it's part of what
-        # makes the planted artefact look like it was actually produced
-        # by normal system/shell behaviour rather than dropped in by a
-        # provisioning tool.
-        mode = "0600" if artefact.kind == "shell_history" else "0644"
-        tasks = [{
-            "name": task_name,
-            "ansible.builtin.lineinfile": {
-                "path": artefact.target_path,
-                "line": artefact.content,
-                "insertafter": "EOF",
-                "create": True,
-                "mode": mode,
-            },
-        }]
-        checks = [_grep_check(task_name, artefact.target_path, artefact.content)]
-        return tasks, checks
 
+    Does not handle log_entry/shell_history - those are batched per
+    target file by _build_line_artefacts_block() instead, called from
+    write_artefact_role()/derive_checks_from_storyline() directly.
+    """
     if artefact.kind == "email_draft":
         task_name = artefact.description
-        directory = posixpath.dirname(artefact.target_path)
         tasks = [
-            {
-                "name": f"{task_name} (create directory)",
-                "ansible.builtin.file": {"path": directory, "state": "directory", "mode": "0700"},
-            },
+            _ensure_dir_task(artefact.target_path),
             {
                 "name": task_name,
                 "ansible.builtin.copy": {"dest": artefact.target_path, "content": artefact.content, "mode": "0600"},
@@ -72,6 +117,7 @@ def _build_task_and_check(artefact: Artefact) -> tuple[list[dict], list[DerivedC
         write_name = f"{artefact.description} (write)"
         delete_name = f"{artefact.description} (delete)"
         tasks = [
+            _ensure_dir_task(artefact.target_path),
             {"name": write_name, "ansible.builtin.copy": {"dest": artefact.target_path, "content": artefact.content, "mode": "0600"}},
             {"name": delete_name, "ansible.builtin.file": {"path": artefact.target_path, "state": "absent"}},
         ]
@@ -97,6 +143,7 @@ def _build_task_and_check(artefact: Artefact) -> tuple[list[dict], list[DerivedC
         # UTC; utc_dt below matches that on the Python side.
         utc_dt = datetime.fromisoformat(artefact.timestamp).replace(tzinfo=timezone.utc)
         tasks = [
+            _ensure_dir_task(artefact.target_path),
             {"name": write_name, "ansible.builtin.copy": {"dest": artefact.target_path, "content": artefact.content, "mode": "0644"}},
             {
                 "name": touch_name,
@@ -136,6 +183,37 @@ def _grep_check(task_name: str, path: str, content: str) -> DerivedCheck:
     )
 
 
+def _all_tasks_and_checks(storyline: Storyline) -> tuple[list[dict], list[DerivedCheck]]:
+    """Build every task and check for `storyline`, batching log_entry/
+    shell_history artefacts by target_path (see _build_line_artefacts_block)
+    and handling every other kind individually via _build_task_and_check.
+
+    groupby() requires artefacts already sorted by its key - artefacts
+    are grouped by (kind, target_path) so log_entry and shell_history
+    lines never share a block even if they happened to target the same
+    path, and so grouping is stable regardless of the artefact list's
+    original order.
+    """
+    tasks: list[dict] = []
+    checks: list[DerivedCheck] = []
+
+    line_artefacts = [a for a in storyline.artefacts if a.kind in _LINE_KINDS]
+    other_artefacts = [a for a in storyline.artefacts if a.kind not in _LINE_KINDS]
+
+    line_artefacts_sorted = sorted(line_artefacts, key=lambda a: (a.kind, a.target_path))
+    for (_kind, target_path), group in groupby(line_artefacts_sorted, key=lambda a: (a.kind, a.target_path)):
+        group_tasks, group_checks = _build_line_artefacts_block(target_path, list(group))
+        tasks.extend(group_tasks)
+        checks.extend(group_checks)
+
+    for artefact in other_artefacts:
+        artefact_tasks, artefact_checks = _build_task_and_check(artefact)
+        tasks.extend(artefact_tasks)
+        checks.extend(artefact_checks)
+
+    return tasks, checks
+
+
 def write_artefact_role(storyline: Storyline, run_dir: Path, scenario_role_name: str = "training_vm") -> Path:
     """Write an Ansible role that plants `storyline`'s artefacts, and
     extend playbook.yml to run it alongside the scenario role.
@@ -149,13 +227,10 @@ def write_artefact_role(storyline: Storyline, run_dir: Path, scenario_role_name:
     (role_dir / "tasks").mkdir(parents=True, exist_ok=True)
     (role_dir / "meta").mkdir(parents=True, exist_ok=True)
 
-    all_tasks: list[dict] = []
-    for artefact in storyline.artefacts:
-        tasks, _ = _build_task_and_check(artefact)
-        all_tasks.extend(tasks)
+    tasks, _ = _all_tasks_and_checks(storyline)
 
     (role_dir / "tasks" / "main.yml").write_text(
-        yaml.dump(all_tasks, sort_keys=False, default_flow_style=False), encoding="utf-8"
+        yaml.dump(tasks, sort_keys=False, default_flow_style=False), encoding="utf-8"
     )
     (role_dir / "meta" / "main.yml").write_text(ROLE_META_TEMPLATE, encoding="utf-8")
 
@@ -179,10 +254,7 @@ def derive_checks_from_storyline(storyline: Storyline) -> list[DerivedCheck]:
     individual construction site, so it can't be forgotten on a future
     artefact kind.
     """
-    checks: list[DerivedCheck] = []
-    for artefact in storyline.artefacts:
-        _, artefact_checks = _build_task_and_check(artefact)
-        checks.extend(artefact_checks)
+    _, checks = _all_tasks_and_checks(storyline)
     for check in checks:
         check.category = "artefact"
     return checks

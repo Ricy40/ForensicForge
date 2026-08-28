@@ -12,6 +12,20 @@ Vagrant.configure("2") do |config|
   config.vm.box = "{box}"
   config.vm.hostname = "{hostname}"
 
+  # Without this, `vagrant up` on Hyper-V prompts interactively whenever
+  # more than one virtual switch exists on the host - which test-deploy
+  # can never answer (no stdin fed to it), so it hangs forever instead of
+  # failing (confirmed by reproducing the hang directly). There is no
+  # Hyper-V *provider* setting for this (checked against Vagrant's own
+  # config.rb - no such attribute exists, despite several guides online
+  # implying otherwise); the provider's configure.rb action instead looks
+  # for a `bridge:` on a public_network/private_network entry and skips
+  # the prompt if one matches an available switch by name. "public_network"
+  # gives the VM an IP on the same network as the switch (Hyper-V has no
+  # VirtualBox-style default NAT), which is what this project's VMs need
+  # regardless of the prompt issue.
+  config.vm.network "public_network", bridge: "{hyperv_switch}"
+
   # Copied over SSH rather than relying on a synced folder: VirtualBox needs
   # Guest Additions for its default /vagrant sync, and Hyper-V's equivalent
   # needs an SMB share (host account credentials, set up interactively).
@@ -24,7 +38,26 @@ Vagrant.configure("2") do |config|
   # directory via "."), since that would also pull in .vagrant/ - which
   # contains files the running `vagrant` process itself holds open, and
   # broke the transfer.
-  config.vm.provision "shell", inline: "mkdir -p {provisioning_path}"
+  #
+  # privileged: false is required, not optional: Vagrant's shell
+  # provisioner defaults to privileged: true (root), so without this the
+  # directory ends up root:root, and the *next* provisioner's SCP upload
+  # (which connects as the plain "vagrant" user, not root) fails with a
+  # permissions error trying to write into it. This went unnoticed until
+  # week 5 forced every test-deploy to actually reprovision from scratch
+  # (`provision=True`, closing the attribution gap) - Vagrant's own
+  # default of skipping already-provisioned machines had been quietly
+  # masking it on every machine reused from an earlier manual boot.
+  #
+  # roles/ is removed before copying, not just re-copied over: a real
+  # rerun on a genuinely fresh VM (confirmed via "Importing a Hyper-V
+  # instance" in the log, not a resumed one) still applied an *older*
+  # version of a role than what was on disk at the time - no confirmed
+  # root cause, but Vagrant's directory-copy file provisioner is the only
+  # thing between "what's on disk here" and "what the guest sees", so
+  # forcing a clean destination removes whatever staleness mechanism was
+  # responsible rather than requiring one to be pinned down first.
+  config.vm.provision "shell", inline: "mkdir -p {provisioning_path} && rm -rf {provisioning_path}/roles", privileged: false
   config.vm.provision "file", source: "playbook.yml", destination: "{provisioning_path}/playbook.yml"
   config.vm.provision "file", source: "roles", destination: "{provisioning_path}/roles"
 
@@ -36,7 +69,12 @@ end
 """
 
 
-def write_vagrantfile(run_dir: Path, hostname: str, box: str = config.VAGRANT_BOX) -> Path:
+def write_vagrantfile(
+    run_dir: Path,
+    hostname: str,
+    box: str = config.VAGRANT_BOX,
+    hyperv_switch: str = config.VAGRANT_HYPERV_SWITCH,
+) -> Path:
     """Write a per-run Vagrantfile pointing at `box` with the ansible_local provisioner.
 
     ansible_local (not the host-side "ansible" provisioner) installs and
@@ -55,7 +93,7 @@ def write_vagrantfile(run_dir: Path, hostname: str, box: str = config.VAGRANT_BO
     "file" provisioners above, so that layout is preserved there too.
     """
     content = VAGRANTFILE_TEMPLATE.format(
-        box=box, hostname=hostname, provisioning_path=PROVISIONING_PATH
+        box=box, hostname=hostname, provisioning_path=PROVISIONING_PATH, hyperv_switch=hyperv_switch
     )
     path = run_dir / "Vagrantfile"
     path.write_text(content, encoding="utf-8")

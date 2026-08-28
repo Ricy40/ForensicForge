@@ -29,8 +29,22 @@ def shell_command_archive(directory: str | None = None) -> str:
 
 
 def shell_command_history_clear() -> str:
-    """A single shell-history line: an attempt to cover tracks."""
-    return "history -c && rm -f ~/.bash_history"
+    """A single shell-history line: an attempt to cover tracks.
+
+    `history -c` alone (clearing the in-memory session history), not
+    `&& rm -f ~/.bash_history` (also deleting the file) - the latter was
+    tried first and is both less realistic (a real attempt to look
+    innocuous rarely also deletes the file outright, which is far more
+    conspicuous) and actively wrong here: this line is meant to sit
+    *alongside* other shell_history artefacts (shell_command_archive(),
+    shell_command_exfiltration()) targeting the same .bash_history file,
+    and deleting that file mid-playbook destroyed the evidence those
+    other tasks had just written - confirmed by reproducing exactly this
+    in a real test-deploy run (3 checks failed, all on lines written
+    before this task ran; everything after it verified fine). See
+    docs/METHODOLOGY.md (week 5).
+    """
+    return "history -c"
 
 
 def auth_log_entry(event: str, when: datetime, user: str | None = None, source_ip: str | None = None) -> str:

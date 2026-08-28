@@ -49,17 +49,26 @@ def _tasks_and_checks(artefact: Artefact, tmp_path):
     return tasks, checks
 
 
-def test_log_entry_artefact_produces_lineinfile_task_and_grep_check(tmp_path):
+def test_log_entry_artefact_produces_blockinfile_task_and_grep_check(tmp_path):
     artefact = Artefact(kind="log_entry", description="Suspicious login", target_path="/var/log/auth.log", content="fake log line")
     tasks, checks = _tasks_and_checks(artefact, tmp_path)
 
-    assert len(tasks) == 1
-    assert tasks[0]["name"] == "Suspicious login"
-    assert tasks[0]["ansible.builtin.lineinfile"]["line"] == "fake log line"
-    assert tasks[0]["ansible.builtin.lineinfile"]["mode"] == "0644"
+    # tasks[0] ensures /var/log exists first (see _ensure_dir_task) -
+    # applied to every file-writing artefact kind, not just ones that
+    # currently need it, after a deleted_file artefact whose parent
+    # directory genuinely didn't exist failed in a real test-deploy run.
+    # blockinfile (not lineinfile) even for a single artefact: log_entry/
+    # shell_history artefacts targeting the same file are always batched
+    # into one atomic write - see _build_line_artefacts_block's docstring
+    # for why (multiple sequential lineinfile writes to the same file
+    # were found not to reliably all survive in a real test-deploy run).
+    assert len(tasks) == 2
+    assert tasks[1]["name"] == "Plant 1 log_entry entries in /var/log/auth.log"
+    assert tasks[1]["ansible.builtin.blockinfile"]["block"] == "fake log line"
+    assert tasks[1]["ansible.builtin.blockinfile"]["mode"] == "0644"
 
     assert len(checks) == 1
-    assert checks[0].task_name == "Suspicious login"
+    assert checks[0].task_name == "Plant 1 log_entry entries in /var/log/auth.log"
     assert checks[0].expected == "fake log line"
     assert "grep -F" in checks[0].command
 
@@ -68,15 +77,39 @@ def test_shell_history_artefact_uses_private_mode(tmp_path):
     artefact = Artefact(kind="shell_history", description="Bad command", target_path="/home/vagrant/.bash_history", content="rm -rf /data")
     tasks, _ = _tasks_and_checks(artefact, tmp_path)
 
-    assert tasks[0]["ansible.builtin.lineinfile"]["mode"] == "0600"
+    assert tasks[1]["ansible.builtin.blockinfile"]["mode"] == "0600"
+
+
+def test_multiple_line_artefacts_to_same_file_batch_into_one_task(tmp_path):
+    """The fix for the "only the last write survived" bug: N artefacts
+    targeting the same file produce one blockinfile task (not N lineinfile
+    tasks), but still N individual verification checks."""
+    artefacts = [
+        Artefact(kind="shell_history", description="cmd 1", target_path="/home/vagrant/.bash_history", content="tar -czf a.tar.gz /data"),
+        Artefact(kind="shell_history", description="cmd 2", target_path="/home/vagrant/.bash_history", content="scp a.tar.gz user@host:/"),
+        Artefact(kind="shell_history", description="cmd 3", target_path="/home/vagrant/.bash_history", content="history -c"),
+    ]
+    storyline = Storyline(id="t", title="t", narrative="t", base_spec="t", artefacts=artefacts)
+    role_dir = write_artefact_role(storyline, tmp_path)
+    tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
+    checks = derive_checks_from_storyline(storyline)
+
+    blockinfile_tasks = [t for t in tasks if "ansible.builtin.blockinfile" in t]
+    assert len(blockinfile_tasks) == 1
+    block = blockinfile_tasks[0]["ansible.builtin.blockinfile"]["block"]
+    assert block == "tar -czf a.tar.gz /data\nscp a.tar.gz user@host:/\nhistory -c"
+
+    assert len(checks) == 3
+    assert {c.expected for c in checks} == {"tar -czf a.tar.gz /data", "scp a.tar.gz user@host:/", "history -c"}
+    assert all(c.task_name == blockinfile_tasks[0]["name"] for c in checks)
 
 
 def test_deleted_file_artefact_verifies_absence(tmp_path):
     artefact = Artefact(kind="deleted_file", description="Exported records", target_path="/tmp/records.csv", content="id,name\n1,x\n")
     tasks, checks = _tasks_and_checks(artefact, tmp_path)
 
-    assert [t["name"] for t in tasks] == ["Exported records (write)", "Exported records (delete)"]
-    assert tasks[1]["ansible.builtin.file"] == {"path": "/tmp/records.csv", "state": "absent"}
+    assert [t["name"] for t in tasks] == ["Ensure /tmp exists", "Exported records (write)", "Exported records (delete)"]
+    assert tasks[2]["ansible.builtin.file"] == {"path": "/tmp/records.csv", "state": "absent"}
 
     assert len(checks) == 1
     assert checks[0].task_name == "Exported records (delete)"
@@ -90,7 +123,7 @@ def test_backdated_file_artefact_computes_utc_epoch_and_sets_changed_when(tmp_pa
     )
     tasks, checks = _tasks_and_checks(artefact, tmp_path)
 
-    touch_task = tasks[1]
+    touch_task = tasks[2]
     assert touch_task["name"] == "Old note (backdate)"
     assert touch_task["changed_when"] is True
     assert "touch -d '2026-01-01T00:00:00Z'" in touch_task["ansible.builtin.command"]

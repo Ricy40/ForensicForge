@@ -125,6 +125,18 @@ def validate(run_dir: Path, role_name: str) -> None:
 
     click.echo(f"Validating {role_dir} ...")
     report = build_validation_report(run_id=run_dir.name, role_dir=role_dir, spec=spec_hint)
+    # Preserves an existing report's test_deploy section rather than
+    # overwriting the whole file: build_validation_report() always sets
+    # test_deploy=None (it doesn't boot anything), and re-running
+    # `validate` after `test-deploy` had silently wiped that section -
+    # confirmed by finding it None in a report a real test-deploy run had
+    # just populated. `test-deploy` itself already merges correctly
+    # (loads, updates one key, re-saves); `validate` needs the same.
+    try:
+        existing = load_report(run_dir)
+        report["test_deploy"] = existing.get("test_deploy")
+    except FileNotFoundError:
+        pass
     write_report(report, run_dir)
 
     _print_scan_summary(report)

@@ -245,6 +245,35 @@ def test_test_deploy_attribution_lookup_matches_role_prefixed_task_name(tmp_path
     assert result.checks[0].attribution == "changed"
 
 
+def test_test_deploy_destroys_even_when_up_fails(tmp_path, monkeypatch):
+    """Regression test: a real run hit this - a provisioner step failed
+    partway through `vagrant up` (after the VM was already created), and
+    the pre-fix version of test_deploy() only ever called destroy() if
+    `up()` succeeded, leaving a real VM running with a lock that then
+    blocked every retry. destroy() must always be attempted.
+    """
+    td = sys.modules["forensicforge.validate.test_deploy"]
+    destroy_called = []
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            pass
+
+        def up(self, provider=None, provision=None):
+            raise subprocess.CalledProcessError(1, ["vagrant", "up"])
+
+        def destroy(self):
+            destroy_called.append(True)
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    result = td.test_deploy(tmp_path, [])
+
+    assert result.booted is False
+    assert result.destroyed is True
+    assert destroy_called == [True]
+
+
 # --- report.py ---
 
 def test_write_and_load_report_round_trip(tmp_path):
