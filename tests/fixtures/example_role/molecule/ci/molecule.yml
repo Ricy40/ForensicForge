@@ -20,6 +20,19 @@ platforms:
     privileged: true
     cgroupns_mode: host
     command: /usr/sbin/init
+    # remote_tmp fixed the path Ansible tried to create, but directory
+    # creation still failed ("did not have permissions on the target
+    # directory") - systemd inside the container wasn't fully up yet to
+    # provide a normal /tmp and /run. volumes + tmpfs below is the
+    # standard "systemd inside Docker" recipe (explicit read-write cgroup
+    # mount, tmpfs for /run and /run/lock so systemd has somewhere to put
+    # its own runtime state) - broader than cgroupns_mode alone, which by
+    # itself wasn't enough here.
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /run/lock
 provisioner:
   name: ansible
   # Confirmed by running this job: the Docker connection plugin's exec
