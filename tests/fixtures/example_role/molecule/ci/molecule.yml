@@ -8,8 +8,14 @@ platforms:
   - name: instance
     # Includes systemd, which our role's `ansible.builtin.service` task
     # needs to actually manage sshd inside the container - the standard
-    # base image for Ansible role testing via Molecule+Docker.
-    image: geerlingguy/docker-ubuntu2004-ansible:latest
+    # base image for Ansible role testing via Molecule+Docker. The 2004
+    # (Ubuntu 20.04) variant was tried first and confirmed broken by
+    # actually running this job: it ships Python 3.8, but the ansible-core
+    # this job pip-installs (no version pin, so it's whatever's current)
+    # requires Python 3.9+ on the managed node - "Ansible requires Python
+    # 3.9 or newer on the target. Current version: 3.8.10". 2204 (Ubuntu
+    # 22.04) ships Python 3.10, which satisfies that.
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
     pre_build_image: true
     privileged: true
     cgroupns_mode: host

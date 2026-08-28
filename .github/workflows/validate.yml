@@ -28,6 +28,16 @@ jobs:
       - name: Install project
         run: pip install -e ".[dev]"
 
+      - name: Install ansible-lint
+        # Not a project dependency (see wsl_bridge.py / docs/METHODOLOGY.md
+        # week 4 - it's Windows-incompatible, so this project never depends
+        # on it directly, only shells out to wherever it's installed: WSL
+        # locally, here on the runner itself). Confirmed missing by
+        # actually running this job: ci_scan.py correctly reported
+        # ansible-lint unavailable and failed the job, rather than silently
+        # skipping it - this step is the fix, not a workaround.
+        run: pip install ansible-lint
+
       - name: Structurally validate the Packer template (python-hcl2)
         run: forensicforge check-packer
 
