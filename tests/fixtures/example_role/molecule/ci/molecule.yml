@@ -1,0 +1,20 @@
+# Docker driver, not the Vagrant driver generated runs use locally - see
+# docs/METHODOLOGY.md (week 4). GitHub's hosted runners support Docker
+# natively but not nested virtualization, so this scenario exists
+# specifically for CI rather than being what `provision` generates.
+driver:
+  name: docker
+platforms:
+  - name: instance
+    # Includes systemd, which our role's `ansible.builtin.service` task
+    # needs to actually manage sshd inside the container - the standard
+    # base image for Ansible role testing via Molecule+Docker.
+    image: geerlingguy/docker-ubuntu2004-ansible:latest
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    command: /usr/sbin/init
+provisioner:
+  name: ansible
+verifier:
+  name: ansible

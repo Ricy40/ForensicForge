@@ -1,0 +1,7 @@
+- name: Converge
+  hosts: all
+  become: true
+  roles:
+    # Namespaced per meta/main.yml's galaxy_info.author - see
+    # provision/ansible_writer.py's ROLE_NAMESPACE docstring.
+    - forensicforge.example_role

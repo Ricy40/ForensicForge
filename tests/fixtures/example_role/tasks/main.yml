@@ -1,0 +1,39 @@
+# A real pipeline output, checked in as a fixture: the SSH pentesting
+# spec's generated role from a week-3 run (generated/20260824-174922/),
+# copied here so CI has something to scan/verify without needing Ollama
+# (which CI doesn't have access to).
+
+- name: Install OpenSSH server
+  ansible.builtin.package:
+    name: openssh-server
+    state: present
+
+- name: Ensure sshd is enabled and running
+  ansible.builtin.service:
+    name: sshd
+    state: started
+    enabled: true
+
+- name: Allow root login with password authentication (for pentesting exercise)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^PermitRootLogin'
+    line: 'PermitRootLogin yes'
+
+- name: Enable password authentication for root (for pentesting exercise)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^PasswordAuthentication'
+    line: 'PasswordAuthentication yes'
+
+- name: Set MaxAuthTries to a high value (for pentesting exercise)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^MaxAuthTries'
+    line: 'MaxAuthTries 1000'
+
+- name: Listen on the default SSH port (22) for pentesting exercises
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Port'
+    line: 'Port 22'

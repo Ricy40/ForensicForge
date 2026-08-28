@@ -1,0 +1,7 @@
+galaxy_info:
+  author: forensicforge
+  description: Fixture role for CI - a checked-in copy of a real generated run.
+  license: MIT
+  min_ansible_version: "2.14"
+
+dependencies: []

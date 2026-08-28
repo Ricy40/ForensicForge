@@ -1,0 +1,1027 @@
+# Methodology
+
+This is a living design record for the ForensicForge dissertation project,
+updated at the end of each implementation week. It explains what exists,
+why it is shaped the way it is, and which trade-offs were made deliberately
+rather than by accident. It is written for the methodology and
+implementation chapters of the dissertation, so it favours honesty about
+limitations over making the current state sound more finished than it is.
+
+## What the project is
+
+ForensicForge is an LLM-driven pipeline that turns a plain-English request
+("Ubuntu server VM with a deliberately weak SSH config for a pentesting
+exercise") into a curriculum-aligned virtual machine definition and,
+eventually, an AI-driven forensic training scenario built around it. The
+end state, six weeks out, is a pipeline that generates a VM specification,
+grounds and structures that specification well enough to hand to
+provisioning tooling (Packer/Vagrant/Ansible), validates it against security
+and correctness gates, and boots it automatically. Each week adds one stage
+of that pipeline rather than building the whole thing shallowly up front,
+so that every stage is something that actually runs before the next one is
+added on top of it.
+
+## Week 1: environment and scaffold
+
+The first week's goal was narrow on purpose: prove that a plain-English
+spec can round-trip through a local LLM and come back as text, with a
+project structure that would not need to be reorganised as later weeks
+added retrieval, provisioning, and validation on top.
+
+**Why a `src/` layout.** The installable package lives under `src/forensicforge/`
+rather than at the repository root. This is a well-worn Python convention
+specifically because it stops the package from being importable by
+accident from the repository root (a common source of "works on my machine"
+bugs where a script one directory up masks the installed package). The
+package is installed editable (`pip install -e .`), so `src/`, `scripts/`,
+`tests/`, and `docs/` all import the same code the same way, and there is
+never a question of which copy of the code is running.
+
+**Why an `LLMBackend` abstract base class.** The project is constrained to a
+local Ollama instance for now, but that constraint is expected to lift —
+the dissertation's evaluation chapter will likely want to compare local and
+hosted models. Rather than sprinkling `ollama.Client()` calls through the
+API, CLI, and (as of week 2) the RAG chain, every one of those call sites
+depends on `LLMBackend.generate(prompt: str) -> str`, and `llm/get_backend()`
+is the single function that decides which concrete backend to instantiate.
+Adding a hosted backend later means writing one new class and changing one
+factory function; it does not mean re-touching every place that currently
+calls Ollama.
+
+**Why FastAPI + a thin CLI over the same shared function.** Both `api.py`
+and `cli.py` call `service.generate_vm_spec()` rather than each
+re-implementing "build a prompt, call the backend." This was a deliberate
+choice to keep the CLI a *convenience wrapper*, not a second code path —
+if the underlying generation logic changes, there is exactly one place to
+change it, and the two interfaces cannot silently drift apart.
+
+**Why the `ollama` Python client instead of raw HTTP.** `localhost:11434/api/generate`
+is a plain REST endpoint and could have been called with `requests` or the
+standard library directly. The official `ollama` package wraps the same
+endpoint and saves hand-rolling request/response JSON handling and error
+cases (e.g. model-not-pulled errors), for the cost of one extra dependency
+that is already a first-party, actively maintained package.
+
+## Week 2: retrieval-augmented generation
+
+Week 1's output, given the SSH pentesting spec, was fluent prose that
+*sounded* plausible but was not grounded in any real `sshd_config` syntax
+and was not structured enough for anything downstream to parse. Week 2's
+goal was to fix both problems: ground the output in a small curated corpus
+of real configuration knowledge, and change the output shape from prose to
+something closer to a provisioning artifact.
+
+### The knowledge corpus
+
+The corpus lives under `knowledge/`, as 26 short markdown documents split
+into three categories:
+
+- **`knowledge/sshd_config/`** (11 documents) — one real `sshd_config`
+  directive per file (`PermitRootLogin`, `PasswordAuthentication`,
+  `PermitEmptyPasswords`, `MaxAuthTries`, `AllowTcpForwarding`,
+  `X11Forwarding`, `ClientAliveInterval`/`ClientAliveCountMax`, weak
+  `Ciphers`/`KexAlgorithms`, `Port`, `LoginGraceTime`, and
+  `PubkeyAuthentication`), each stating what it does and, where relevant,
+  why a particular setting is a real vulnerability.
+- **`knowledge/ansible_tasks/`** (7 documents) — short, valid Ansible task
+  snippets for the operations a generated scenario will actually need:
+  installing/enabling OpenSSH, setting individual `sshd_config` directives
+  with `lineinfile` versus templating the whole file, restarting `sshd` via
+  a handler, managing `ufw` firewall rules (and deliberately disabling
+  them), creating a user with a set password, and installing a package
+  generically (including pinning an outdated version on purpose).
+- **`knowledge/misconfigurations/`** (8 documents) — broader vulnerability
+  patterns not specific to SSH, each with a one-line "why this is real"
+  justification: open/allow-all firewalls, default or weak credentials,
+  unencrypted telnet/FTP, world-writable files, unpatched packages,
+  unauthenticated exposed databases, and disabled audit logging.
+
+This split (directive knowledge / provisioning knowledge / vulnerability
+rationale) was deliberate: a single generated scenario typically needs a
+directive-level fact ("what does `PermitRootLogin` do"), a provisioning
+fact ("what does the Ansible task that sets it look like"), and a framing
+fact ("why is this combination a real weakness worth teaching") — keeping
+those as separate retrievable units means the retriever can pull exactly
+the ones relevant to a given spec instead of always pulling one large
+mixed document. One document per fact also keeps each embedding vector
+representing one coherent idea, rather than an under- or over-broad
+mixture, which is the standard argument for small retrieval units in RAG
+system design.
+
+This is a first-pass set focused on the SSH pentesting example used
+throughout weeks 1–2. It does not yet cover other service families
+(web servers, databases beyond the one exposed-database note, Windows/AD
+misconfigurations) — that is expected to grow as more scenario types are
+exercised in later weeks, and is worth a deliberate coverage review rather
+than silently expanding.
+
+### Embeddings and vector store
+
+**Why `nomic-embed-text`.** Ollama's embedding model library was checked
+directly rather than assumed (model recommendations age quickly). At time
+of writing, `nomic-embed-text` remains the most widely used local embedding
+model on Ollama by a large margin, is a comparatively small download
+(~274 MB against ~670 MB for `mxbai-embed-large` or ~1.2 GB for `bge-m3`),
+and supports a large (8192-token) context window — more headroom than our
+current short corpus documents need, but useful if later weeks' corpus
+documents grow longer. It was pulled the same way `check_ollama.py`
+already handled the generation model: checked for, listed as one of a few
+reasonable options, and only pulled after an explicit yes.
+
+**Why Chroma.** The brief for this week explicitly favoured "no server
+dependency," which ruled out Qdrant, Weaviate, and Milvus in their typical
+deployment form (a running service/container). That leaves an embedded
+choice between Chroma and FAISS. Chroma was chosen because it has a
+first-party LangChain integration (`langchain-chroma`) that manages
+documents, metadata, and embeddings together as a single persistent
+on-disk store; FAISS's LangChain wrapper is a thinner layer over a
+similarity-search index and leaves more of the docstore/metadata
+bookkeeping to the caller. For a corpus this size (26 documents), that
+difference does not matter much yet, but it will as the corpus grows to
+cover more scenario types — Chroma's approach is the one that scales
+without extra plumbing. The persisted store lives at `.chroma/` (gitignored,
+like any other build artifact) and is rebuilt automatically the first time
+it doesn't exist; there is currently no staleness check against edits to
+`knowledge/`, so editing the corpus requires deleting `.chroma/` by hand to
+force a rebuild. That is a known gap, not an oversight — a hash-based
+staleness check is a reasonable week 3+ addition once the corpus is large
+enough that rebuilding on every run would be wasteful.
+
+### LangChain's role, and where it deliberately stops
+
+LangChain is used for the retrieval half of the pipeline only:
+`langchain_core.documents.Document` for the corpus items,
+`langchain_chroma.Chroma` for the vector store, and its `.as_retriever()`
+interface for top-k similarity search. Generation still goes through the
+project's own `LLMBackend.generate()` from week 1, not through LangChain's
+`ChatModel`/LCEL abstractions. This was a deliberate line, not an
+oversight: `LLMBackend` is already the seam intended for swapping models
+and providers later, and wrapping generation in a second, competing
+abstraction (a LangChain `Runnable` chain ending in a chat model) would
+mean two different places claiming ownership of "how a prompt becomes
+text." Using LangChain where it has no such competing concern (loading and
+retrieving documents) and leaving generation alone keeps exactly one seam
+per concern. `src/forensicforge/rag/chain.py` is consequently a plain
+function — retrieve, format a prompt, call the existing backend — rather
+than an LCEL pipeline; the orchestration the brief asked for happens in
+that function's control flow, not in a `Runnable` object.
+
+Only `langchain-core`, `langchain-ollama`, and `langchain-chroma` are
+dependencies, not the umbrella `langchain` package. The umbrella package
+additionally pulls in chain/agent implementations for providers and
+tools this project does not use; the three integration packages provide
+everything the retrieval path needs (`Document`, `OllamaEmbeddings`,
+`Chroma`) without that extra surface area.
+
+### Output format: Ansible tasks over a raw config block
+
+The generated output was steered toward a YAML list of Ansible tasks (each
+with a `name` and a module such as `ansible.builtin.lineinfile` or
+`ansible.builtin.service`), plus a short "applied misconfigurations"
+section, rather than a raw `sshd_config` file block. Week 3's stated scope
+is Packer/Vagrant/Ansible provisioning, so Ansible tasks are the format
+that stage will actually consume directly — a raw `sshd_config` block only
+covers one file for one service, whereas a spec might also need firewall
+rules, user accounts, or package installs, all of which are naturally
+different Ansible modules but the same task-list shape. A single
+consistent output format is also easier to validate mechanically in week 4
+(`ansible-lint` operates on exactly this shape) than a mix of free-form
+config-file syntax that would differ per service.
+
+### RAG over a longer static prompt
+
+An alternative to retrieval would have been to paste the entire corpus
+into every prompt. That was rejected for two reasons. First, it does not
+scale — the corpus is expected to grow well past 26 documents as later
+weeks cover more scenario types, and a static prompt grows (and costs
+tokens) with the whole corpus regardless of relevance to the current spec,
+while retrieval's cost is bounded by *k* regardless of corpus size. Second,
+retrieval is traceable in a way a static prompt is not: because retrieval
+happens per-request, the API and CLI can report exactly which corpus
+documents were retrieved for a given spec (surfaced as `snippets` in both),
+which is useful for debugging bad output and will likely be useful again
+in the evaluation chapter when explaining why a given generation looked
+the way it did.
+
+### Keeping the ungrounded path available
+
+`generate_vm_spec(spec, use_rag=True)` is the new default, but
+`use_rag=False` reproduces the exact week-1 behaviour (`prompts.build_prompt`,
+no retrieval). This was kept, rather than deleted, specifically so the
+dissertation's evaluation chapter can compare grounded and ungrounded
+output for the same spec directly, rather than relying on memory of what
+week 1's output looked like. The CLI exposes this as `--no-rag`; the API as
+`"use_rag": false` in the request body.
+
+## Week 3: Packer, Vagrant, and Ansible provisioning
+
+Week 2 ended with output that was grounded and shaped like an Ansible task
+list, but nothing downstream had ever actually tried to run it. Week 3's
+job was to close that gap: turn a generated task list into a real Ansible
+role, generate a Vagrantfile that boots a VM and provisions it with that
+role, and confirm — on a real machine, not just by reading the generated
+files — that the deliberately weak configuration actually lands.
+
+### A naming loose end, tied off first
+
+Before building on top of week 2, the package name was checked end to end
+(committed git history, the working tree, and the installed package) after
+a discrepancy was noticed between what an earlier week's README said and
+what week 2's summary said. All three were already consistent as
+`forensicforge` — the `vmforge` name that appeared briefly was a mid-session
+rename in an earlier week's chat transcript that was never actually
+committed under that name. Worth stating plainly here since a
+half-renamed package is exactly the kind of thing that causes confusing
+import errors weeks later if it goes unchecked.
+
+### Parsing LLM output into a real Ansible role
+
+`build_rag_prompt()` (week 2) asks the model for a fenced ` ```yaml ` block
+followed by an "Applied misconfigurations" section, but asking for a shape
+and getting it reliably are different things — nothing before week 3
+verified the model actually produced valid YAML, or a valid task list
+inside it. `src/forensicforge/provision/ansible_writer.py` adds that check
+as an explicit step with three stages, each of which can fail independently
+and be attributed to a specific cause: extract the fenced code block with a
+regex (`extract_yaml_block`), parse it with `yaml.safe_load`
+(`parse_tasks`), and check that the parsed value is a non-empty list of
+mappings that each have at least a `name` key. Any failure raises
+`AnsibleParseError`, which carries the raw LLM output as an attribute
+specifically so the CLI can print exactly what the model produced instead
+of a bare "parsing failed" — that matters for a project whose evaluation
+chapter will want to know *how often* and *how* generation fails, not just
+that it sometimes does. Nothing is written to disk unless all three stages
+succeed, so a failed run never leaves a half-written role directory behind
+to be mistaken for a working one.
+
+This is deliberately a low bar — "is this a syntactically valid task list
+with names" — not real policy validation. `ansible-lint` and Checkov are
+explicitly week 4's job and check meaningfully different things (module
+argument correctness, security policy compliance) that would be premature
+to half-implement here. The point of doing even this much now was the
+brief's own framing: garbage-in-garbage-out being silently written to disk
+is not acceptable at any stage, even before proper gating exists.
+
+**Why plain PyYAML rather than `ruamel.yaml`.** `ruamel.yaml`'s main
+advantage over PyYAML is round-trip fidelity — loading a YAML document,
+modifying it, and dumping it back out while preserving comments, key order,
+and formatting. That matters when a human-authored YAML file is being
+edited programmatically. It does not apply here: the extracted YAML block
+is validated and then written to `tasks/main.yml` *verbatim*, as the exact
+text the model produced, rather than being parsed into Python objects and
+re-serialized. `yaml.safe_load` is used only to check the text is valid and
+shaped correctly; its output is discarded once that check passes. Since
+there is no load-modify-dump cycle, PyYAML's plain (and already-installed,
+as a transitive dependency of other packages) `safe_load` does everything
+required, and `ruamel.yaml` would be an added dependency for a capability
+this code path doesn't use.
+
+### The generated-directory-per-run structure
+
+Each successful `provision` run writes to `generated/<run-id>/`, where
+`run-id` is a timestamp (`YYYYMMDD-HHMMSS`), containing:
+
+```
+generated/<run-id>/
+    Vagrantfile
+    playbook.yml
+    roles/
+        <role-name>/
+            tasks/main.yml
+            meta/main.yml
+```
+
+Every run gets its own directory rather than overwriting a single
+`generated/` output, and every file a `vagrant up` in that directory needs
+(the Vagrantfile, the playbook, the role) is self-contained inside it —
+nothing references a shared or previous run. That makes each run
+independently disposable (`vagrant destroy` plus deleting the directory
+leaves no trace) and directly comparable to other runs side by side, which
+will matter once week 4 starts running many specs through the pipeline
+and needs to keep their outputs apart. `generated/` is gitignored for the
+same reason `.chroma/` is: it is a build artifact reproducible from the
+spec and the current corpus/prompt, not a source file.
+
+### `ansible_local`, not the host-side `ansible` provisioner
+
+The generated Vagrantfile provisions with Vagrant's `ansible_local`
+provisioner, which installs Ansible *inside the guest* on first boot and
+runs the playbook there, rather than the `ansible` provisioner, which
+expects Ansible to already be installed on the host machine running
+`vagrant up`. Ansible does not support running natively on Windows as a
+control node (it works under WSL, but requiring WSL as a hard dependency
+was rejected to keep the host-side setup to "install Vagrant and a
+provider," matching how the project has otherwise avoided host-level
+dependencies beyond Ollama). `ansible_local` trades a slower first boot
+(the guest has to install Ansible via `pip`/`apt` before it can provision
+itself) for zero host-side Ansible dependency, which was judged the right
+trade for a dev machine that does not otherwise need Ansible installed at
+all.
+
+### Packer vs. a stock box: the trade-off, made explicit
+
+The brief asked directly for this trade-off to be named rather than
+decided silently, so: `packer/ubuntu-base.pkr.hcl` builds a minimal Ubuntu
+20.04 base box via VirtualBox and cloud-init autoinstall, but the
+Vagrantfiles `provision` actually generates this week boot from the stock
+`generic/ubuntu2004` box on Vagrant Cloud, not the Packer-built one.
+
+The case for wiring in the Packer box immediately would be fidelity to the
+eventual real pipeline — a custom-built base image is what a finished
+system would use, since it can bake in exactly the base state (packages,
+users, hardening baseline) the project wants every scenario to start from,
+rather than inheriting whatever `generic/ubuntu2004`'s maintainers shipped.
+The case against, this week specifically, is build time and unverified
+risk stacked on top of an already-new part of the pipeline: a Packer build
+is a 15–30+ minute unattended OS install that depends on an ISO URL and
+checksum staying valid, cloud-init autoinstall behaving as expected, and
+Packer's VirtualBox and Vagrant plugins being installed and working — none
+of which had been exercised on this machine before this week. (The Packer
+CLI binary itself turned out to already be present in the repository root
+as a plain downloaded executable, `packer_1.16.0_windows_amd64/packer.exe`,
+predating this week's work and unrelated to it — confirmed working
+(`packer --version` → `1.16.0`) and added to `.gitignore`, but its plugins
+have not been installed and the template has still not actually been run.)
+Debugging a broken Packer build and debugging whether a generated Ansible
+role behaves correctly are different problems, and this week's actual goal
+was the second one: prove a generated role can provision *a* VM correctly.
+Using a known-good stock box isolates that question from "does the custom
+image build work," rather than debugging both at once the first time
+either is tried.
+
+One more consideration this week's actual `vagrant up` surfaced after this
+section was first written: `ubuntu-base.pkr.hcl` uses Packer's
+`virtualbox-iso` builder, but the dev machine turned out not to be able to
+run VirtualBox VMs at all (see "what watching the first boot actually
+caught" below) — the generated Vagrantfiles now default to the Hyper-V
+provider on this machine instead. A VirtualBox-format box built by the
+current template would not be usable there without either running Packer
+on a machine that can still run VirtualBox, or retargeting the template at
+Packer's `hyperv-iso` builder. This is exactly the kind of thing isolating
+the stock-box decision from the custom-image decision was meant to avoid
+having to debug simultaneously - noted here for whenever the Packer box
+is actually wired in, rather than guessed at now.
+
+The Packer template is consequently built but not run or verified — see
+`packer/README.md` for its exact unfinished edges (an ISO checksum that
+will need rechecking against whatever Ubuntu 20.04 point release is
+current, and a placeholder autoinstall password). Wiring it in is a
+short, well-scoped follow-up once it has actually been built and confirmed
+to produce a working box: point `config.vm.box` at the registered box name
+instead of `generic/ubuntu2004`, which is a one-line change in
+`vagrantfile_writer.py`.
+
+### What's automated versus what's still manual
+
+`forensicforge provision "<spec>"` automates every step through writing the
+Vagrantfile and role to disk, and prints the exact `cd`/`vagrant up`
+command to run next — but it deliberately does not run `vagrant up` itself.
+Booting a VM is slow (minutes, not seconds), this is the first week
+virtualization is involved at all, and the brief was explicit that the
+first boot should be watched rather than automated blind. Full
+boot-smoke-test-destroy automation via `python-vagrant` is explicitly
+week 4 scope, once there is a validation step worth automating the boot
+*around*. Automating a boot loop before there is anything to check beyond
+"did it boot" would be automation for its own sake.
+
+### What watching the first boot actually caught
+
+The first real `vagrant up` against a generated run failed immediately,
+before any provisioning ran, with `The following settings shouldn't exist:
+roles_path`. `vagrantfile_writer.py`'s original template set
+`ansible.roles_path = "roles"` on the assumption that `ansible_local`
+supported the same `roles_path` option the host-side `ansible` provisioner
+does; it doesn't — checked against Vagrant's own documentation afterward,
+`roles_path` isn't in `ansible_local`'s options, nor in the set of options
+shared between the two provisioners. The fix was to drop the setting
+entirely rather than find an equivalent: Ansible already searches for a
+`roles/` directory next to the playbook by default, which is exactly the
+layout `ansible_writer.py` produces (`playbook.yml` and `roles/` as
+siblings under `generated/<run-id>/`), so the option was never needed.
+
+This is precisely the class of mistake unit tests around
+`ansible_writer.py` could not have caught — they check that a role
+directory is written and shaped correctly, not that Vagrant accepts the
+option syntax used to reference it. It is also the concrete justification,
+independent of the brief's own reasoning, for not automating `vagrant up`
+before a human had watched it succeed at least once: an automated
+boot-and-destroy loop would have failed the same way, but silently
+folded into "provisioning failed" logs rather than being caught and fixed
+in the time it took to read one error message on a real terminal.
+
+With that fixed, the next `vagrant up` failed before Vagrant itself did
+anything: `VBoxManage` couldn't lock the newly-created VM
+(`E_ACCESSDENIED`). This traced to Windows 11's Memory Integrity
+(Core Isolation/HVCI) being active on the dev machine — a documented,
+fairly common VirtualBox-on-Windows-11 incompatibility, confirmed by
+checking `Win32_DeviceGuard` directly rather than guessed at. The
+standard fix is disabling Memory Integrity, but that was explicitly
+rejected here: it also gates several kernel-level anti-cheat systems, and
+this machine is used for that too. So the provider changed instead of the
+security setting - `generic/ubuntu2004` already publishes a Hyper-V
+variant, Windows' own hypervisor platform was already active anyway (WSL2
+requires it), and the generated Vagrantfile never hardcoded a provider in
+the first place, so switching only meant enabling the Hyper-V Windows
+feature and passing `--provider=hyperv`. This is worth recording as a
+methodological point, not just a fix: a security constraint the user
+already holds for an unrelated reason (anti-cheat compatibility)
+determined a provisioning-tooling decision. That is a real category of
+constraint a deployed version of this pipeline would need to detect or
+ask about, not assume away.
+
+Switching providers surfaced a second, independent gap: `ansible_local`
+depends on a synced folder to find `playbook.yml` and `roles/` on the
+guest (default path `/vagrant`), and Vagrant only wires that synced folder
+up automatically for providers with a native shared-folder mechanism -
+VirtualBox has one (Guest Additions); Hyper-V doesn't, and needs an
+explicit SMB share instead, which meant an interactive prompt for the
+host Windows account's actual password (not the Hello PIN normally used
+to sign in, which doesn't work for network authentication at all - itself
+worth noting as a real point of user friction). Rather than accept that
+credential prompt, the Vagrantfile template was changed to stop depending
+on synced folders entirely: a `file` provisioner now copies `run_dir`'s
+contents to the guest over the SSH connection Vagrant already has and
+trusts, and `ansible_local`'s `provisioning_path` points at that copied
+location instead of the default `/vagrant`. This works identically
+regardless of provider and needs no credentials at all, which in hindsight
+is arguably the better default independent of the Hyper-V/VirtualBox
+question - depending on a provider-specific synced-folder mechanism was
+the fragile choice, not the SSH-based copy every provider already supports
+the same way.
+
+That first version of the SSH-copy fix (`source: "."`, copying `run_dir`
+wholesale) itself failed on the next real attempt, with a generic
+`SCP did not finish successfully` error and no further detail. Two things
+were wrong with it, found by checking Vagrant's own file-provisioner
+documentation and issue tracker rather than guessing from the error alone:
+first, `run_dir` by that point also contained `.vagrant/` (Vagrant's own
+per-run state directory, created the moment `vagrant up` first ran) - a
+generic recursive copy pulled that in too, including files the running
+`vagrant` process itself holds open, which is a plausible way to break an
+SCP transfer outright. Second, and independently, Vagrant's file
+provisioner is documented as not reliably creating missing *nested* parent
+directories on the guest - a single new directory under an already-existing
+parent works, but the destination used here needed two new levels
+(`/home/vagrant/forensicforge/roles`) created at once. The fix addressed
+both: an explicit `shell` provisioner now runs `mkdir -p` on the exact
+destination path before anything is copied, and the `file` provisioners
+that follow name `playbook.yml` and `roles/` individually rather than
+copying `run_dir` as a whole - narrower, but avoids both problems at once
+rather than working around either in isolation.
+
+Three real failures in a row, each caught on the first real `vagrant`
+invocation and each fixed within one exchange, is itself a data point
+worth recording plainly: none of them were reachable from the unit tests
+around `ansible_writer.py`, none were guessable in advance without
+checking Vagrant's actual documented behaviour instead of assuming
+parity between providers or provisioners, and each one only existed
+because this was the first time this exact combination (Windows 11 host,
+Hyper-V provider, `ansible_local`, a from-scratch generated Vagrantfile)
+had actually been run rather than reasoned about.
+
+### Confirmed working
+
+With all three fixed, `vagrant provision` completed cleanly (7 tasks,
+3 changed, 0 failed), and `vagrant ssh` into the running VM confirmed
+`PermitRootLogin yes`, `PasswordAuthentication yes`, and `MaxAuthTries
+1000` all active in the live `/etc/ssh/sshd_config` - the week 3
+definition of done, met against a real generated spec on a real booted
+machine.
+
+One detail from that verification is worth recording rather than glossing
+over: the `PermitRootLogin` task reported `ok` (no change), not `changed`.
+`generic/ubuntu2004` turns out to already ship with `PermitRootLogin yes`
+active by default - a "convenience box" trait, not unusual for a
+general-purpose Vagrant Cloud image, but a genuine mismatch with what a
+curriculum-aligned pentesting scenario should be able to assume about its
+starting state. `PasswordAuthentication`, by contrast, did report
+`changed`, meaning the box's stock config was more locked down there. This
+is a small, concrete instance of a larger and more important point: a
+generated task can be entirely correct and still land on a base image that
+was already partway to (or past) the intended state, for reasons the
+generation step has no visibility into. Nothing here validates that a
+generated role's *effect* matches its *intent* against a specific base
+image - only that it ran without error. That gap is squarely what week 4's
+validation stage needs to cover, and this is a real rather than
+hypothetical example of why it's needed.
+
+## Week 4: scanning, gating, and automated test-deploy
+
+Week 3 ended on a finding that motivated this entire week: the manual
+verification step (`vagrant ssh` + `grep`) confirmed `PermitRootLogin yes`
+was live on the booted VM, but closer inspection showed the Ansible task
+that claimed to set it had reported `ok`, not `changed` - the
+`generic/ubuntu2004` box already shipped with that setting, unrelated to
+anything the generated role did. Week 3's pipeline had no way to notice
+that distinction; it only checked that generation produced parseable
+YAML. Week 4's job was to add the layer that would have caught it, or to
+say plainly if nothing available actually catches it.
+
+### The scanning module and a shared result shape
+
+`src/forensicforge/validate/scanners.py` defines two small dataclasses -
+`Finding` (one issue: rule id, message, severity, file, line) and
+`ScanResult` (a tool's overall verdict: `passed`, a list of `Finding`s, a
+tool-specific `summary` dict, and an `error` string) - that every scanner
+in the module returns, regardless of how different the underlying tool's
+own output format is. `run_checkov()` and `run_ansible_lint()`
+(scanners.py), `run_molecule()` (molecule_runner.py), and
+`validate_packer_template()` (hcl_check.py) all normalize into this same
+shape. The point of doing this rather than passing each tool's raw JSON
+through is `report.json`: a single per-run report can iterate over
+`report["scans"]` uniformly, and `aggregate_reports()` can compute a pass
+rate across tools and runs without needing to know each tool's native
+schema.
+
+`ScanResult.passed` is a three-state value on purpose: `True`, `False`,
+or `None`. `None` means the tool itself could not be run - not installed,
+not reachable, timed out - and is kept structurally distinct from `False`
+(the tool ran and found a problem). Collapsing those two into a boolean
+would have made "the scanner was unavailable" indistinguishable from "the
+scanner passed" in the aggregate statistics, which is exactly the kind of
+silent false-positive this week's brief was about avoiding.
+
+### The Windows/POSIX wall, again
+
+Wiring in `ansible-lint` and Molecule ran straight into a bigger version
+of a problem this project already knew about from week 3 (Ansible not
+running natively on Windows, which is why generated Vagrantfiles use the
+`ansible_local` provisioner). `ansible-lint` and Molecule both depend on
+`ansible-core`, and `ansible-core` imports POSIX-only standard library
+modules - `grp` (used by `ansible-lint`) and `fcntl` (used by Molecule) -
+that simply do not exist on Windows. Neither tool can be imported, let
+alone run, in this project's Windows virtual environment, regardless of
+driver or configuration choices. This was discovered empirically
+(`ModuleNotFoundError: No module named 'grp'`, then `'fcntl'`), not
+anticipated - it is a materially bigger constraint than "Ansible doesn't
+run on Windows," because it means the *tooling that checks* Ansible
+doesn't run on Windows either.
+
+Checkov and `python-hcl2` do not have this problem - both are pure Python
+with no `ansible-core` dependency - and were confirmed to run natively
+before assuming so (`checkov -m checkov.main --version` and a real scan,
+`hcl2.load()` against the actual Packer template).
+
+`src/forensicforge/validate/wsl_bridge.py` is the answer for the two
+tools that do need it: on Windows, `run_posix_tool()` shells out to WSL
+(already installed on this machine since week 3, for the same underlying
+reason); on any other platform - specifically, GitHub Actions' Linux
+runners - it runs the command directly, since there is nothing to route
+around there. `scanners.run_ansible_lint()` and
+`molecule_runner.run_molecule()` both call this same dispatcher rather
+than hardcoding a WSL call, so the identical scanning code runs correctly
+whether it's invoked from this Windows dev machine or from CI. `ansible-lint`
+and Molecule are consequently *not* Python dependencies of this project
+(`pyproject.toml`) at all - the Windows venv never imports them, only
+shells out to wherever they're actually installed (WSL locally, the CI
+runner's own environment there). `scripts/check_wsl_tools.py` checks
+whether WSL is responsive and whether the two tools are installed inside
+it, and - matching every other setup script in this project -asks before
+installing anything.
+
+One correctness bug surfaced while building this: the first version of
+`run_in_wsl()` had a single timeout covering the entire WSL invocation, so
+when WSL itself was unresponsive (see below), every call waited out the
+*full* timeout (300s) before reporting failure - two scanners in sequence
+meant a ten-minute wait to learn nothing could run. The fix was a
+separate, short "liveness" probe (`wsl -- true`, 10s timeout) run before
+the real command: a WSL that fails *that* fails fast, while a WSL that
+passes it but then hangs on the real command still gets however long that
+command legitimately needs.
+
+### Docker checked, not assumed - and found not to be it
+
+The brief was explicit about not assuming Molecule's default Docker
+driver would work, given this project already hit one virtualization
+surprise (VirtualBox blocked by Windows' Memory Integrity, resolved by
+switching Vagrant to the Hyper-V provider in week 3). That caution turned
+out to be warranted a second time, for a different reason: `docker info`
+showed the Docker Desktop CLI installed but its engine unreachable
+(`open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file
+specified`). Relaunching Docker Desktop and waiting did not resolve it.
+Investigating further, a completely unrelated problem turned up: the
+machine's C: drive had 0 bytes free, which is independently sufficient to
+break Docker Desktop's engine startup (and very likely explains why it
+was already in a bad state before this session touched anything). Once
+disk space was freed, Docker Desktop was relaunched again - and its
+engine still did not come up, and a basic `wsl --list --verbose` call
+also hung for 90+ seconds without responding, pointing at the shared
+Hyper-V-backed virtualization subsystem needing a clean restart (most
+likely a reboot) rather than anything specific to Docker. Given that,
+the project moved forward with the **Vagrant driver**
+(`molecule-plugins[vagrant]`) for locally-generated roles' Molecule
+scenarios, per the brief's own fallback instruction, rather than waiting
+on a reboot that was the user's call to schedule, not this session's.
+
+This decision is scoped to *this machine, right now* - it is a real
+example of the "verify, don't assume" principle producing a different
+answer than "verify, don't assume" produced for the Vagrant provider
+question in week 3, because the actual failure was different (a stuck
+virtualization subsystem, not a security-feature conflict). It is not a
+claim that Docker is unusable on this machine in general, only that it
+was not usable at the moment this needed to be decided, and the fallback
+existed specifically so that not being knowable in advance wouldn't block
+the week.
+
+### Why CI's Molecule scenario uses Docker anyway
+
+GitHub Actions' hosted runners are a different environment with a
+different answer to the same question: they support Docker natively but
+have no nested virtualization, so a Vagrant-driven scenario (booting a
+real VM inside the runner) cannot work there at all, for a structural
+reason rather than a this-machine-right-now reason. Rather than force one
+driver choice to serve both purposes, the two are kept separate:
+`provision/molecule_writer.py` renders a Vagrant-driven `molecule/default/`
+scenario into every generated run (matching what this dev machine can
+actually execute), while `tests/fixtures/example_role/molecule/ci/`
+is a second, Docker-driven scenario against a *fixture* role - a real
+role from an actual week-3 run (`generated/20260824-174922/roles/training_vm/`),
+copied in as a static example - specifically for CI to exercise against.
+CI cannot run the live pipeline in any case, since it has no access to
+Ollama; a checked-in fixture was needed regardless of the driver
+question, so splitting the driver by environment cost nothing extra.
+
+### Checkov's real coverage, and the PermitRootLogin problem specifically
+
+The brief asked directly: if Checkov or `ansible-lint` don't catch the
+class of problem that motivated this week (a claimed change that isn't
+actually attributable to the generated role), say so honestly rather than
+force a fix that doesn't really solve it. Checked directly rather than
+assumed: Checkov's Ansible framework ships exactly six built-in checks
+(`checkov/ansible/checks/task/`) - unauthenticated apt installs, `apt
+force`, and TLS certificate validation for `get_url`/`uri`/`yum` - plus
+two AWS-specific EC2 checks. None of them inspect `ansible.builtin.package`,
+`ansible.builtin.service`, `ansible.builtin.lineinfile`, or
+`ansible.builtin.user`, which are the only modules any role this pipeline
+has generated so far actually uses. Running Checkov against
+`generated/20260824-174922/roles/training_vm/` returns `resource_count: 0`
+- confirmed to be genuine ("nothing here matches a check I have") rather
+than a broken invocation, by constructing a minimal task using
+`get_url`/`validate_certs: false` and confirming Checkov correctly flags
+*that* (`CKV_ANSIBLE_2`, `passed: False`). **Checkov, as currently
+scoped, will essentially always report a trivial pass against this
+project's generated roles.** That is recorded here as a limitation, not
+smoothed over as "Checkov ran clean" - a `passed: true` in `report.json`
+for a role Checkov did not actually have a check for should not be read
+as "Checkov verified this role is fine."
+
+`ansible-lint` is closer to relevant (it checks Ansible style/correctness
+broadly, not a fixed list of security-flavoured module checks), but
+neither it nor Checkov can catch the specific PermitRootLogin case even
+in principle, for a structural reason: **that failure mode is not a
+property of the role's YAML at all.** The role's task is syntactically
+and semantically correct - "ensure this line is present in this file" is
+exactly what `lineinfile` does, correctly, regardless of what the file
+already contained. The gap is entirely in *attribution*: whether the
+resulting live state was caused by the task or already true beforehand.
+No static analysis of the role file can answer that, because the answer
+depends on the base image, which the role file says nothing about. The
+only place that distinction is actually observable is at
+apply-time - specifically, an Ansible `changed`/`ok` result, exactly the
+signal that gave the game away manually in week 3. `test_deploy.py`
+captures this automatically now (each `CheckResult` records whether the
+expected line was found, and `derive_checks_from_role()`'s checks are the
+mechanical version of the same manual grep), but it verifies *end state*,
+not *attribution* - a check passing still doesn't distinguish "the role
+caused this" from "this was already true." Actually closing that gap
+would mean capturing and comparing Ansible's own per-task `changed`
+status, which is possible in principle (Molecule's `verify.yml` or a
+`-vv` capture of the converge run could do it) but was not built this
+week: recorded here as an accurate limitation rather than implemented as
+a fix that would only address one symptom of a broader true problem
+(fidelity between the box a role runs on and the box the role's author -
+here, an LLM prompted against SSH-specific knowledge snippets - implicitly
+assumed).
+
+### python-vagrant and a real bug in error visibility
+
+`src/forensicforge/validate/test_deploy.py` scripts the boot → verify →
+destroy cycle `python-vagrant` wraps around the `vagrant` CLI. Building it
+surfaced a bug worth recording because it would have made every future
+failure hard to diagnose: `python-vagrant`'s `up()` and `destroy()` are
+implemented over `subprocess.check_call` internally
+(`Vagrant._call_vagrant_command`), not `check_output` - unlike `.ssh()`,
+which does use `check_output` and so raises a `CalledProcessError` with
+real `.output` content on failure. `check_call`'s `CalledProcessError`
+never carries stdout/stderr *at all*, regardless of how the instance's
+`quiet_stdout`/`quiet_stderr` flags are set, because `check_call` was
+never given anywhere to capture it. First attempt at surfacing a real
+failure (deliberately reproduced: `vagrant up --provider=hyperv` without
+an elevated terminal) returned only `Command '[...]' returned non-zero
+exit status 1` - true, but useless for telling a permissions problem
+apart from a missing box, a bad Vagrantfile, or anything else. The fix
+was to give `Vagrant()` a custom `out_cm`/`err_cm` that appends to
+`run_dir/vagrant.log` instead of the default (discarded to `/dev/null`
+under `quiet_stdout=True`), and read the tail of that file back into
+`TestDeployResult.error` on failure. Re-run against the same reproduced
+failure, this correctly surfaces the actual Vagrant message ("The
+Hyper-V provider requires that Vagrant be run with administrative
+privileges...") - confirming both that the fix works and, incidentally,
+that `test-deploy` genuinely does need an elevated terminal on this
+machine, the same Hyper-V constraint week 3 already established for
+`vagrant up`.
+
+`derive_checks_from_role()` turns each `lineinfile` task's `path`/`line`
+into a `sudo grep -F -- '<line>' <path>` check - mechanically
+reconstructing the exact manual command used to verify the SSH example in
+week 3, but from whatever the role actually contains rather than
+hardcoded to that one spec. Run against the real week-3 role, it derives
+all four checks (`PermitRootLogin`, `PasswordAuthentication`,
+`MaxAuthTries`, `Port`) correctly and automatically.
+
+### After the reboot: getting ansible-lint and Molecule to actually run
+
+A reboot (the user's own call, once free to do it) settled WSL and Docker
+Desktop, confirming the earlier diagnosis: the virtualization subsystem
+genuinely needed a clean restart, not a code-level workaround. What
+followed was setting up the WSL side for real and running the
+WSL-dependent code paths above against live tools for the first time,
+rather than only against mocked `run_posix_tool()` calls - and that
+surfaced four more real bugs, none of which unit tests (necessarily
+mocking the WSL boundary) could have caught.
+
+**WSL's Ubuntu was minimal - no `pip` at all.** Recent Ubuntu blocks
+installing into system Python directly (PEP 668, "externally managed
+environment"), and `python3-venv` - needed to route around that the
+standard way - itself needs `apt`, which needs a sudo password this
+session has no way to supply (entering a password on the user's behalf
+is out of scope regardless - see this project's own safety rules). The
+one `sudo apt install python3-pip python3-venv` had to be run by the user
+directly in their own WSL terminal; everything after that (creating a
+venv at `~/.forensicforge-tools`, `pip install`ing `ansible-lint` and
+`molecule`/`molecule-plugins[vagrant]` into it) could proceed normally.
+`config.WSL_TOOLS_VENV` and `scripts/check_wsl_tools.py` reflect this
+final setup - a dedicated venv, not WSL's system Python.
+
+**Command strings crossing the Windows subprocess → wsl.exe → WSL bash
+boundary reliably corrupt embedded quote characters.** Getting Molecule's
+Vagrant driver working needed `ANSIBLE_LIBRARY` set to a path computed by
+a small Python snippet (see below); every attempt to pass that snippet
+inline via `python3 -c "..."` came out mangled on the WSL side - single
+quotes inside double quotes, double quotes inside single quotes, even a
+base64-encoded payload (where only the wrapping quotes, not the payload
+itself, contained anything to corrupt) - all failed the same way,
+reproduced repeatedly with `repr()` of the exact bytes sent confirming
+the string was correct *before* the wsl.exe boundary and wrong *after*.
+The fix (`scripts/wsl_helpers/print_vagrant_modules_dir.py`,
+`wsl_bridge.py`'s `to_wsl_path()`) was to stop putting inline scripts in
+command strings altogether: write the logic to a real `.py` file and
+invoke it by path, which has no quotes to mangle. Anything that needs to
+run POSIX-side Python logic through this bridge in future should follow
+the same pattern rather than re-attempting inline `-c` strings.
+
+**`source venv/bin/activate && export X=$(python3 ...)` doesn't reliably
+find the venv's `python3` inside the `$(...)` subshell**, even though
+`source` ran first in the same `&&` chain and the *same* pattern without
+`$(...)` works fine (confirmed: `molecule --version` after `source
+activate` correctly finds the venv's `molecule`). Root cause not fully
+pinned down; worked around by calling the venv's `python3` by absolute
+path (`{WSL_TOOLS_VENV}/bin/python3`), which needs no `PATH` resolution
+or prior activation at all. Combined with the quoting problem above, the
+most robust fix was to abandon folding the computation into the main
+`molecule test` command via `$(...)` entirely: `_find_ansible_library()`
+in `molecule_runner.py` is now a *separate* `run_posix_tool()` call whose
+captured stdout is read back into this Python process, then passed to
+the next call as a literal value - sidestepping both problems by never
+asking a subshell three layers deep to hand back a value at all.
+
+**Ansible role resolution failed twice, for two different reasons - both
+found by reproducing `ansible-playbook`'s actual "role not found" error
+directly rather than trusting Molecule's own summary output.** First:
+`ansible-compat`'s local-role-install step (part of Molecule's "prerun")
+symlinks the role under a *namespaced* name - `forensicforge.training_vm`,
+not bare `training_vm` - derived from `meta/main.yml`'s `galaxy_info.author`
+field (confirmed by finding the actual symlink under `~/.ansible/roles/`).
+`molecule_writer.py`'s `converge.yml` referenced the bare name, so
+resolution failed. Fixed by introducing `ROLE_NAMESPACE` as a single
+constant shared between `ansible_writer.py` (which writes the `author:`
+field) and `molecule_writer.py` (which writes `converge.yml`'s `roles:`
+list) - see `ROLE_NAMESPACE`'s docstring in `ansible_writer.py` - so the
+two can't drift apart silently again. Second, and separately: the
+Vagrant *provider* choice belongs under `driver.provider.name` in
+`molecule.yml`, not `platforms[].provider.name` where the first version
+of `MOLECULE_YML_TEMPLATE` put it. That mistake didn't produce an error -
+it silently fell back to molecule-plugins' vagrant Ansible module's own
+default provider, `virtualbox`, confirmed by inspecting the actual
+Vagrantfile Molecule generated (`c.vm.provider "virtualbox"`) before the
+fix and `c.vm.provider "hyperv"` after. Silently falling back to
+VirtualBox is exactly the failure mode week 3 already worked around by
+switching to Hyper-V in the first place, so this bug would have
+reintroduced it invisibly - the Vagrantfile `provision` generates was
+never wrong, only the *separate* Vagrantfile Molecule generates for its
+own ephemeral instance.
+
+With all four fixed, a live `run_molecule()` against the real week-3 role
+now gets through `destroy` (proving the `vagrant` Ansible module
+resolves - the `ANSIBLE_LIBRARY` fix), `syntax` (proving the role
+resolves - the namespace fix), and correctly generates a Hyper-V
+Vagrantfile (the provider-location fix) before reaching `create` - the
+actual VM boot. That step could not be completed live this session, for
+two compounding reasons rather than one: `create` needs the same elevated
+terminal `test-deploy`'s `vagrant up` needs (confirmed identically -
+`vagrant up --no-provision` failing with the Hyper-V administrative-
+privileges message), and separately, this machine's VirtualBox
+installation still has multiple VMs stuck `<inaccessible>`
+(`E_ACCESSDENIED`, `LockMachine` failing) - the same Memory Integrity
+conflict documented in week 3, now also affecting some of Vagrant's own
+internal machine-index bookkeeping for the ephemeral instances Molecule's
+Vagrant driver creates. Three VMs left behind by this session's own
+repeated `molecule create` attempts were cleaned up
+(`VBoxManage unregistervm --delete`); three pre-existing `<inaccessible>`
+VMs of unknown origin were deliberately left alone rather than deleted
+without being sure they weren't something the user cared about
+investigating. **The molecule-driven boot itself remains unverified
+live** - the configuration is now demonstrably correct (right Vagrantfile,
+right role resolution, right module path), but confirming a full
+create → converge → verify → destroy cycle actually succeeds needs the
+user's own elevated terminal, the same as `test-deploy`.
+
+### report.json and aggregation
+
+Each `validate`/`test-deploy` CLI run writes (or updates)
+`report.json` in the run directory: `scans` (checkov, ansible-lint),
+`molecule`, and `test_deploy`, each in the common `ScanResult`/
+`TestDeployResult` shape above, plus `run_id`, `spec`, and a generation
+timestamp. `validate` and `test-deploy` are separate commands writing to
+the same file rather than one combined command, because they have
+different environment requirements (`validate` is CI-safe; `test-deploy`
+needs a real hypervisor and an elevated terminal) and different runtimes
+(`validate` finishes in seconds; `test-deploy` takes minutes) - forcing
+them into one command would mean either running the slow one every time
+or awkwardly flagging it off.
+
+`aggregate_reports()` scans every `generated/*/report.json` and computes,
+per tool, `{passed, applicable, rate}` - `applicable` excludes runs where
+that tool reported `None` (unavailable), so an unreachable scanner drags
+down "applicable" rather than silently counting as a pass or corrupting
+the rate. This is deliberately the same shape the DPIaC-Eval benchmark
+referenced in the background report uses for a deployability/compliance
+rate: with more than one run's worth of `report.json` files (there is
+currently one, from week 3, retrofitted with a `validate`/`test-deploy`
+pass this week), `forensicforge report-summary` becomes the aggregate
+number the dissertation's evaluation chapter needs, computed the same way
+every time rather than assembled by hand per chapter draft.
+
+### Why CI doesn't run test-deploy
+
+GitHub's hosted runners don't support nested virtualization, so neither
+Vagrant+Hyper-V (this project's actual local setup) nor Vagrant+VirtualBox
+could boot a real VM there regardless of provider choice - this isn't a
+configuration gap to work around, it's a structural property of the
+runners. `test-deploy` stays a local-only command; CI's `validate.yml`
+covers `check-packer`, the checkov/ansible-lint scans (via
+`scripts/ci_scan.py`, reusing this project's own scanning code rather
+than re-implementing invocation logic in YAML), the unit test suite, and
+Molecule verification against the checked-in fixture role (Docker driver,
+per above) - everything that can genuinely run on a hosted runner, and
+nothing that would either fail structurally or need to be faked to pass.
+
+The workflow itself (`.github/workflows/validate.yml`) has not been
+exercised by an actual push yet as of writing - recorded honestly rather
+than presented as verified, consistent with how the WSL-dependent parts
+of this week are also flagged as code-complete-but-not-live-tested below.
+
+## Libraries and tools
+
+- **FastAPI** — the HTTP interface (`POST /generate`). Chosen over Flask
+  for built-in request/response validation via Pydantic models, which
+  matters once the response shape includes structured fields like
+  `snippets` rather than a single string.
+- **Uvicorn** — the ASGI server FastAPI runs on; the standard pairing for
+  a FastAPI app, no alternative seriously considered.
+- **`ollama` (Python client)** — talks to the local Ollama server for text
+  generation. Chosen over raw `requests` calls to `/api/generate` for
+  built-in request/response handling; see week 1 rationale above.
+- **click** — the CLI framework. Chosen over `argparse` for declarative
+  option/argument definitions (`@click.option`, `@click.argument`) that
+  stay readable as the CLI grows more flags (this week added `--no-rag`).
+- **langchain-core** — provides the `Document` schema and retriever
+  interface the RAG path is built on. Used instead of the full `langchain`
+  package; see the LangChain section above for why.
+- **langchain-ollama** — provides `OllamaEmbeddings`, a LangChain-compatible
+  wrapper around Ollama's embedding endpoint. Used instead of calling
+  `ollama.Client().embeddings()` directly because `langchain-chroma`
+  expects a LangChain `Embeddings` interface, and the official adapter is
+  less code than hand-writing an equivalent wrapper.
+- **langchain-chroma** — the LangChain integration for the Chroma vector
+  store. See the vector store rationale above.
+- **chromadb** — the underlying embedded vector database `langchain-chroma`
+  wraps. Not called directly at the moment; depended on explicitly (rather
+  than left as a transitive dependency) because `vectorstore.py` may need
+  to reach into it directly in a later week (e.g. for the staleness check
+  noted above).
+- **pytest** — the test runner. No alternative considered; it is the
+  de facto standard for this kind of project.
+- **httpx** — a `pytest`-time dependency only, required by FastAPI's
+  `TestClient` for in-process request testing.
+- **PyYAML** — parses and validates the YAML block extracted from LLM
+  output in `ansible_writer.py`. Already present as a transitive dependency
+  of other packages before week 3; made an explicit direct dependency now
+  that the project imports it itself. Chosen over `ruamel.yaml` because
+  nothing here round-trips a YAML document (load, edit, re-dump) — the
+  validated text is written to disk verbatim, so `ruamel.yaml`'s comment-
+  and formatting-preserving round-trip would be paying for a capability
+  this code path never uses; see the week 3 parsing section above.
+- **python-hcl2** — parses `.pkr.hcl` into Python data structures for
+  `hcl_check.py`'s structural validation. Runs natively everywhere (pure
+  Python, no `ansible-core`-style POSIX dependency); the only HCL parser
+  seriously considered, since it's the standard choice for this in Python.
+- **checkov** — the Ansible-framework security/policy scanner
+  (`scanners.run_checkov`). Runs natively on Windows for the same reason
+  python-hcl2 does. A large dependency (pulls in `boto3`, `cryptography`,
+  and much more Checkov doesn't need for the narrow Ansible-only use this
+  project makes of it) — accepted as the cost of using an actively
+  maintained, multi-framework scanner that already has *some* Ansible
+  checks, rather than hand-rolling policy checks from scratch. See the
+  week 4 section above for the honest limit on what those checks actually
+  cover.
+- **python-vagrant** — wraps the `vagrant` CLI for `test_deploy.py`'s
+  boot/verify/destroy automation. The only actively maintained Python
+  wrapper for Vagrant; the alternative (shelling out to `vagrant` directly
+  and parsing text output) is what this library exists to avoid, though
+  building on it surfaced a real gap (see the `check_call` note above)
+  that had to be worked around rather than solved by the library itself.
+- **ansible-lint** and **Molecule** (+ **molecule-plugins**) — *not*
+  Python dependencies of this project (not in `pyproject.toml`). Both are
+  invoked via `wsl_bridge.run_posix_tool()`, installed inside WSL locally
+  or in the CI runner's own environment, never imported by this Windows
+  venv — see the week 4 Windows/POSIX section above for why.
+
+Outside Python: **Packer** and **Vagrant** (HashiCorp CLI tools) generate
+and boot the VM — `packer/ubuntu-base.pkr.hcl` and the generated per-run
+`Vagrantfile`s call them, respectively. Vagrant requires a provider: this
+project uses **Hyper-V** on the dev machine (week 3), with **VirtualBox**
+still what the (unwired) Packer template targets (`virtualbox-iso`
+builder) — a known mismatch, noted in the week 3 section, that matters
+once the Packer box is actually wired in. **Docker** is what CI's Molecule
+scenario uses (hosted runners support it natively); **WSL2** is what
+`ansible-lint`/Molecule run inside of locally, on Windows.
+
+## Known limitations going into week 5
+
+- The knowledge corpus covers the SSH pentesting example thoroughly but not
+  other scenario families yet; coverage should be revisited as new spec
+  types are exercised.
+- There is no cache-invalidation check between `knowledge/` and the
+  persisted `.chroma/` store — edits to the corpus require deleting
+  `.chroma/` by hand.
+- There is no automated comparison metric between grounded and ungrounded
+  output yet, only the ability to produce both for the same spec; building
+  an actual evaluation metric is deferred to the dissertation's evaluation
+  chapter.
+- `packer/ubuntu-base.pkr.hcl` has not been built or verified and is not
+  wired into the Vagrantfiles `provision` generates, and now specifically
+  targets the wrong provider for this machine's actual Vagrant setup
+  (VirtualBox vs. Hyper-V) — see the Packer-vs-stock-box and week 4
+  Packer-provider sections above.
+- Only one Ansible role per run is supported (a single `role_name`), and
+  the role is provisioned into `all` hosts in `playbook.yml` — fine for a
+  single-VM-per-spec scenario, which is all the pipeline produces so far.
+- Checkov's Ansible framework covers 6 built-in checks, none of which
+  match the modules this project's generated roles actually use — a
+  `passed: true` from Checkov in `report.json` currently means "nothing
+  applicable was found to check," not "this role was verified secure."
+  See the week 4 section above for the full reasoning and what would
+  actually be needed to close it (broader custom checks, or leaning more
+  on `ansible-lint`).
+- The specific failure mode that motivated week 4 (a claimed change not
+  actually attributable to the generated role, because the base image
+  already had it) is not fully closed. `test_deploy.py` verifies *end
+  state* automatically now, which is strictly more than week 3 had, but
+  distinguishing "the role caused this" from "this was already true"
+  would need capturing Ansible's own per-task `changed` status during
+  the converge run, which was not built this week — see the week 4
+  section above.
+- `ansible-lint` runs live against the real week-3 role as of this week
+  and correctly found a genuine issue (`meta/main.yml` missing the
+  `license` field `galaxy_info` requires) — see the "After the reboot"
+  section above. Molecule runs live through `destroy`/`syntax` (proving
+  the `vagrant` module and role resolution both work) and correctly
+  generates a Hyper-V Vagrantfile, but the actual `create` step (booting
+  a VM) remains unverified end-to-end — see below. The Linux-native code
+  path (what CI actually uses) is still exercised only by unit tests with
+  a mocked subprocess call, not a real CI run — `.github/workflows/validate.yml`
+  has not been pushed and run.
+- Neither `test-deploy` nor a full live `molecule test` has completed an
+  actual VM boot this week. Both need the same elevated terminal `vagrant
+  up` needed in week 3 (confirmed by deliberately reproducing the
+  failure, which now surfaces a real, readable error rather than the
+  generic one - see the python-vagrant section above), and Molecule's
+  attempt additionally ran into three VMs on this machine stuck
+  `<inaccessible>` in VirtualBox (the same Memory Integrity conflict
+  documented in week 3), which needed manual cleanup for VMs this
+  session's own testing created and were left alone for three of unknown
+  origin. Completing either requires the user's own elevated terminal,
+  per the project's established pattern of not running `vagrant`
+  operations unattended.
+- Vagrant's own state can go stale in ways this project's code doesn't
+  clean up: Molecule's ephemeral directory name is derived from the
+  role's own directory name (not the full per-run path), so repeated
+  `molecule`/`test-deploy` attempts using the same default role name
+  (`training_vm`) can leave Vagrant's global machine index
+  (`~/.vagrant.d/data/machine-index/index` on Windows) or VirtualBox's own
+  registry pointing at machines from an earlier, differently-configured
+  attempt. `molecule test`'s own `destroy` step cleans up within its
+  current ephemeral directory but not this global bookkeeping. Not fixed
+  this week - a real operational gap for any future automated/repeated
+  test-deploy runs, worth revisiting if it recurs.

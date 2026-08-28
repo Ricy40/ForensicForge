@@ -1,0 +1,24 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US
+  keyboard:
+    layout: us
+  ssh:
+    install-server: true
+    allow-pw: true
+  identity:
+    hostname: forensicforge-base
+    username: vagrant
+    # SHA-512 crypt hash of "vagrant" (openssl passwd -6 -salt forensicforge vagrant) -
+    # matches the ssh_password in ubuntu-base.pkr.hcl. Not a real secret,
+    # just the standard disposable-box convention every stock Vagrant box uses.
+    password: "$6$forensicforge$ttgnyHM9bolDSELexv8TvsM7W0SQj/mr52rm2iww5bX1j1oUbMyUMiMI3Xpl9.aNtaMHfrPm5xMcYnW18BSTf/"
+  storage:
+    layout:
+      name: direct
+  packages:
+    - openssh-server
+  late-commands:
+    - echo 'vagrant ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/vagrant
+    - chmod 440 /target/etc/sudoers.d/vagrant
