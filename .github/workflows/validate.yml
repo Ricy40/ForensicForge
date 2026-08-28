@@ -1,0 +1,56 @@
+name: Validate
+
+# Scoped to what GitHub's hosted runners can actually do: static scans
+# (HCL structure, ansible-lint, Checkov) and Molecule role verification
+# via the Docker driver. Full test-deploy (boot a real VM via Vagrant +
+# Hyper-V, verify config, destroy) needs nested virtualization the hosted
+# runners don't have and stays local-only - see docs/METHODOLOGY.md
+# (week 4) for the full reasoning.
+#
+# CI has no access to Ollama, so it can't run the RAG pipeline itself -
+# scans and Molecule verification run against tests/fixtures/example_role,
+# a real generated role checked into the repo, rather than a live spec.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static-scans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        run: pip install -e ".[dev]"
+
+      - name: Structurally validate the Packer template (python-hcl2)
+        run: forensicforge check-packer
+
+      - name: Run ansible-lint + Checkov against the fixture role
+        run: python scripts/ci_scan.py
+
+      - name: Run unit tests
+        run: pytest
+        # Tests that need a local Ollama instance skip themselves
+        # (see tests/conftest.py) - nothing to configure here.
+
+  molecule:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Molecule with the Docker driver
+        run: pip install molecule "molecule-plugins[docker]" ansible-core
+
+      - name: Run Molecule against the fixture role (Docker driver, "ci" scenario)
+        working-directory: tests/fixtures/example_role
+        run: molecule test --scenario-name ci
