@@ -32,7 +32,9 @@ RAG_SYSTEM_PROMPT = (
     "`ansible.builtin.user`) inside a ```yaml code block.\n"
     "2. An 'Applied misconfigurations' section: one line per deliberate "
     "weakness introduced, naming which snippet it came from and why it's a "
-    "real vulnerability."
+    "real vulnerability. Quote the exact directive/line you set in "
+    "backticks (e.g. `PermitRootLogin yes`) so each claim can be checked "
+    "against the config file automatically."
 )
 
 

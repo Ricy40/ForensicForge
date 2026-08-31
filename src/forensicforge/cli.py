@@ -4,7 +4,14 @@ from pathlib import Path
 import click
 
 from . import config
-from .forensics import derive_checks_from_storyline, provision_storyline
+from .forensics import (
+    build_storyline_from_vulnerabilities,
+    derive_checks_from_storyline,
+    load_storyline,
+    provision_storyline,
+    save_storyline,
+    write_artefact_role,
+)
 from .forensics.scenarios import ALL_SCENARIOS
 from .provision import AnsibleParseError, provision_spec
 from .service import generate_vm_spec
@@ -14,6 +21,7 @@ from .validate import (
     derive_checks_from_role,
     load_report,
     validate_packer_template,
+    verify_vulnerabilities,
     write_report,
 )
 from .validate.test_deploy import test_deploy as run_test_deploy
@@ -150,23 +158,38 @@ def validate(run_dir: Path, role_name: str) -> None:
     "--storyline", "scenario_id", default=None,
     help="Forensic scenario id (see `forensic-scenario` with no argument) to also verify planted evidence for.",
 )
-def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None) -> None:
+@click.option(
+    "--storyline-file", "storyline_file", default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to a storyline.json written by `forensic-scenario-from-run` (a run-specific "
+    "storyline, not one of the fixed ids --storyline looks up) to verify planted evidence for.",
+)
+def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None, storyline_file: Path | None) -> None:
     """Boot the generated VM, verify its config, then destroy it - automatically.
 
     Replaces the manual `vagrant up` workflow from week 3. Requires an
     elevated terminal on this machine (Hyper-V provider requirement) - see
     docs/METHODOLOGY.md. Updates/creates report.json in RUN_DIR. Pass
-    --storyline to also verify a forensic scenario's planted evidence
-    (must match whatever `forensic-scenario` was run for this RUN_DIR).
+    --storyline to also verify one of the fixed demo scenarios' planted
+    evidence, or --storyline-file for a run-specific one built by
+    `forensic-scenario-from-run` (must match whatever was actually planted
+    into this RUN_DIR).
     """
     role_dir = run_dir / "roles" / role_name
     checks = derive_checks_from_role(role_dir)
+
+    if scenario_id and storyline_file:
+        click.echo("Pass only one of --storyline / --storyline-file.", err=True)
+        raise SystemExit(1)
 
     if scenario_id:
         storyline = ALL_SCENARIOS.get(scenario_id)
         if storyline is None:
             click.echo(f"Unknown scenario: {scenario_id!r}.", err=True)
             raise SystemExit(1)
+        checks = checks + derive_checks_from_storyline(storyline)
+    elif storyline_file:
+        storyline = load_storyline(storyline_file)
         checks = checks + derive_checks_from_storyline(storyline)
 
     if not checks:
@@ -177,7 +200,7 @@ def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None) -> N
 
     click.echo(f"  booted:            {result.booted}")
     click.echo(f"  config_verified:   {result.config_verified}")
-    if scenario_id:
+    if scenario_id or storyline_file:
         click.echo(f"  artefacts_verified: {result.artefacts_verified}")
     click.echo(f"  destroyed:         {result.destroyed}")
     for check in result.checks:
@@ -199,6 +222,106 @@ def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None) -> N
     report["test_deploy"] = result.to_dict()
     write_report(report, run_dir)
     click.echo(f"\nWrote {run_dir / config.REPORT_FILENAME}")
+
+
+@main.command(name="verify-vulnerabilities")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--role-name", default="training_vm", help="Role name within run_dir/roles/.")
+def verify_vulnerabilities_cmd(run_dir: Path, role_name: str) -> None:
+    """Check RUN_DIR's own claimed misconfigurations against a real, booted VM.
+
+    Reads the 'Applied misconfigurations' claims the LLM made at
+    generation time (generation.md, persisted since week 6 - runs
+    provisioned before this won't have one), matches each to the
+    lineinfile task that's supposed to apply it, then boots the VM and
+    reports per claim: claimed, actually true on the live VM or not, and
+    (via the existing attribution machinery) whether the role itself
+    caused it or it was already true beforehand. A claim that can't be
+    matched to a checkable task is reported as NOT VERIFIABLE, not
+    silently skipped. Boots and destroys its own VM - see
+    docs/METHODOLOGY.md (week 6).
+    """
+    role_dir = run_dir / "roles" / role_name
+    click.echo(f"Verifying claimed vulnerabilities for {run_dir} (boots + destroys a VM) ...")
+
+    try:
+        result = verify_vulnerabilities(run_dir, role_dir)
+    except FileNotFoundError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1)
+
+    click.echo(f"  booted:    {result.booted}")
+    click.echo(f"  destroyed: {result.destroyed}")
+    for finding in result.findings:
+        mark = "SKIP" if not finding.verifiable else ("TRUE" if finding.actual else "FALSE")
+        click.echo(f"  [{mark}] {finding.claim}")
+        click.echo(f"         {finding.note}")
+    if result.error:
+        click.echo(f"  error: {result.error}", err=True)
+
+    try:
+        report = load_report(run_dir)
+    except FileNotFoundError:
+        report = {"run_id": run_dir.name, "scans": None, "molecule": None, "test_deploy": None}
+    report["vulnerabilities"] = result.to_dict()
+    write_report(report, run_dir)
+    click.echo(f"\nWrote {run_dir / config.REPORT_FILENAME}")
+
+
+@main.command(name="forensic-scenario-from-run")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--role-name", default="training_vm", help="Role name within run_dir/roles/.")
+def forensic_scenario_from_run_cmd(run_dir: Path, role_name: str) -> None:
+    """Build and plant a forensic storyline derived from RUN_DIR's OWN
+    verified vulnerabilities, instead of a hand-authored, decoupled one.
+
+    Runs `verify-vulnerabilities` first (boots + destroys a VM), picks the
+    first claim that's both verified true AND attributed to this run's own
+    role as this scenario's entry vector, then builds a narrative and
+    artefact set around it and plants them. Fails clearly if no claim
+    clears that bar - see docs/METHODOLOGY.md (week 6). Verify the planted
+    evidence afterward with `test-deploy --storyline-file`.
+    """
+    role_dir = run_dir / "roles" / role_name
+    spec_path = run_dir / config.SPEC_FILENAME
+    if not spec_path.exists():
+        click.echo(f"No {config.SPEC_FILENAME} recorded for {run_dir} - re-run `provision` first.", err=True)
+        raise SystemExit(1)
+    spec = spec_path.read_text(encoding="utf-8")
+
+    click.echo(f"Verifying claimed vulnerabilities for {run_dir} (boots + destroys a VM) ...")
+    try:
+        vuln_report = verify_vulnerabilities(run_dir, role_dir)
+    except FileNotFoundError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1)
+
+    for finding in vuln_report.findings:
+        mark = "SKIP" if not finding.verifiable else ("TRUE" if finding.actual else "FALSE")
+        click.echo(f"  [{mark}] {finding.claim}")
+
+    try:
+        storyline = build_storyline_from_vulnerabilities(vuln_report, spec=spec, run_id=run_dir.name)
+    except ValueError as exc:
+        click.echo(f"\nCannot build a storyline: {exc}", err=True)
+        raise SystemExit(1)
+
+    artefact_role_dir = write_artefact_role(storyline, run_dir, scenario_role_name=role_name)
+    storyline_path = run_dir / "storyline.json"
+    save_storyline(storyline, storyline_path)
+
+    try:
+        report = load_report(run_dir)
+    except FileNotFoundError:
+        report = {"run_id": run_dir.name, "scans": None, "molecule": None, "test_deploy": None}
+    report["vulnerabilities"] = vuln_report.to_dict()
+    write_report(report, run_dir)
+
+    click.echo(f"\n{storyline.title}\n  {storyline.narrative}\n")
+    click.echo(f"Wrote artefact role:     {artefact_role_dir}")
+    click.echo(f"Wrote storyline manifest: {storyline_path}")
+    click.echo("\nNext:")
+    click.echo(f"  forensicforge test-deploy {run_dir} --storyline-file {storyline_path}")
 
 
 @main.command(name="check-packer")

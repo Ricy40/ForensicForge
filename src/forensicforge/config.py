@@ -62,3 +62,11 @@ WSL_TOOLS_VENV = os.environ.get("FORENSICFORGE_WSL_TOOLS_VENV", "~/.forensicforg
 
 # Name of the report file written per test-deploy/validate run.
 REPORT_FILENAME = "report.json"
+
+# Per-run files persisting what `provision_spec()` actually asked for and
+# actually got back from the LLM - needed by verify-vulnerabilities (week 6)
+# to check a run's *own* claimed misconfigurations rather than a hardcoded
+# SSH-specific list. Not written before week 6, so older runs under
+# generated/ won't have them - see docs/METHODOLOGY.md (week 6).
+SPEC_FILENAME = "spec.txt"
+GENERATION_FILENAME = "generation.md"

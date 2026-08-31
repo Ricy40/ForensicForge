@@ -1,4 +1,6 @@
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -40,3 +42,19 @@ class Storyline:
     narrative: str
     base_spec: str
     artefacts: list[Artefact] = field(default_factory=list)
+
+
+def save_storyline(storyline: Storyline, path: Path) -> None:
+    """Persist a Storyline to disk so a later CLI invocation (e.g.
+    `test-deploy --storyline-file`) can verify its artefacts without
+    needing the object that built it still in memory - needed for
+    storylines built by storyline_builder.py, which are specific to one
+    run rather than one of the fixed ids in scenarios.ALL_SCENARIOS.
+    """
+    path.write_text(json.dumps(asdict(storyline), indent=2), encoding="utf-8")
+
+
+def load_storyline(path: Path) -> Storyline:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["artefacts"] = [Artefact(**a) for a in data["artefacts"]]
+    return Storyline(**data)

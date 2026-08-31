@@ -10,22 +10,34 @@ from .test_deploy import (
     parse_task_attribution,
     test_deploy,
 )
+from .vulnerabilities import (
+    ClaimedVulnerability,
+    VulnerabilityFinding,
+    VulnerabilityReport,
+    parse_applied_misconfigurations,
+    verify_vulnerabilities,
+)
 
 __all__ = [
     "CheckResult",
+    "ClaimedVulnerability",
     "DerivedCheck",
     "Finding",
     "ScanResult",
     "TestDeployResult",
+    "VulnerabilityFinding",
+    "VulnerabilityReport",
     "aggregate_reports",
     "build_validation_report",
     "derive_checks_from_role",
     "load_report",
+    "parse_applied_misconfigurations",
     "parse_task_attribution",
     "run_ansible_lint",
     "run_checkov",
     "run_molecule",
     "test_deploy",
     "validate_packer_template",
+    "verify_vulnerabilities",
     "write_report",
 ]

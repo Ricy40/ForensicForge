@@ -47,13 +47,26 @@ def shell_command_history_clear() -> str:
     return "history -c"
 
 
-def auth_log_entry(event: str, when: datetime, user: str | None = None, source_ip: str | None = None) -> str:
-    """A syslog-style line for an auth-relevant event (e.g. USB mount, large transfer)."""
+def service_log_entry(service: str, event: str, when: datetime, user: str | None = None, source_ip: str | None = None) -> str:
+    """A syslog-style line for any service's auth-relevant event.
+
+    Generalizes what used to be auth_log_entry()'s sshd-only line, so a
+    storyline whose entry vector isn't SSH (a database, Telnet, an open
+    firewall rule - see storyline_builder.py, week 6) can still produce a
+    plausible log line naming the actual service involved, rather than
+    every storyline claiming an SSH login regardless of what the run's
+    own generation step actually claimed to misconfigure.
+    """
     user = user or fake.user_name()
     source_ip = source_ip or fake.ipv4_private()
     timestamp = when.strftime("%b %d %H:%M:%S")
     hostname = fake.hostname().split(".")[0]
-    return f"{timestamp} {hostname} sshd[{fake.random_int(1000, 9999)}]: {event} for user {user} from {source_ip}"
+    return f"{timestamp} {hostname} {service}[{fake.random_int(1000, 9999)}]: {event} for user {user} from {source_ip}"
+
+
+def auth_log_entry(event: str, when: datetime, user: str | None = None, source_ip: str | None = None) -> str:
+    """A syslog-style line for an SSH auth-relevant event (e.g. USB mount, large transfer)."""
+    return service_log_entry("sshd", event, when, user=user, source_ip=source_ip)
 
 
 def email_draft(subject: str, body: str, sender: str | None = None, recipient: str | None = None) -> str:

@@ -1371,6 +1371,364 @@ notice that its own tasks had actually run.** The gap is entirely in the
 later (8/12, for the reasons above), which is exactly the distinction
 attribution was built to make visible rather than blur together.
 
+## Week 6: proving dynamic generation, closing the vulnerability-claim gap, and tying storylines to real VMs
+
+Week 5 left three things genuinely open rather than closed: every demo had
+centred on SSH pentesting, so "the pipeline responds to different specs"
+was asserted rather than shown; "applied misconfigurations" was still a
+claim the LLM made at generation time with no automated way to check it
+against a live VM (week 4's attribution work closed *how* a claim would
+be checked, but nothing actually read the claims and checked them); and
+the three forensic storylines were, on inspection, built independently of
+whatever a given run's role actually did. This week closes all three -
+the last one by building something new, not by relabelling what already
+existed.
+
+### Proving dynamic generation, and what it actually found
+
+Rather than vary a spec's *wording* around the same SSH-pentesting core
+(the acknowledged limitation of week 5's own three demo storylines - see
+the `scenarios.py` module docstring), three spec categories were
+provisioned for real, live, this week: an SSH bastion host, an Ubuntu
+server with Telnet enabled and a permissive firewall, and a database
+server with PostgreSQL exposed with no authentication. A fourth (audit
+logging disabled + world-writable permissions) was added afterward to
+get a second, non-SSH, *fully checkable* example for the verify-
+vulnerabilities work below.
+
+The honest result: the corpus is broader than "SSH-only" suggests -
+`knowledge/misconfigurations/` has eight distinct categories (weak SSH
+root login, open firewall, default credentials, unencrypted Telnet,
+world-writable permissions, unpatched packages, exposed database, disabled
+audit logging), and retrieval genuinely pulled from different ones for
+different specs, producing structurally different generated roles, not
+the same SSH tasks with a different hostname templated in:
+
+- The **Telnet/firewall** spec produced a role with zero `lineinfile`
+  tasks at all - `ansible.builtin.package` (installing `telnetd`) and
+  `community.general.ufw` (firewall policy) instead. Genuinely different
+  module usage, not a reskin.
+- The **audit-logging/permissions** spec produced a role editing
+  `/etc/rsyslog.d/50-default.conf` (disabling SSH login logging via
+  `authpriv.none`) and creating a `0777` shared directory - again, no
+  overlap with the SSH-bastion role's `/etc/ssh/sshd_config` edits.
+- The **database** spec reliably retrieved
+  `misconfigurations/exposed_database_no_auth.md` and produced PostgreSQL-
+  specific tasks (`listen_addresses`, `pg_hba.conf`) - genuinely on-topic
+  content - but failed to parse as YAML *both times* it was generated,
+  on the same root cause: the LLM wrote
+  `line: 'listen_addresses = '*''`, nesting an unescaped `'*'` inside an
+  already single-quoted YAML scalar. This is a real, reproducible LLM
+  output bug distinct from week 5's "ubuntu user" hallucination - not an
+  infrastructure problem, and not fixed this week (rerolling twice and
+  getting the identical failure both times is itself the finding; a
+  templating/escaping fix on the *prompt* side would be the real fix, and
+  is future work, not a week 6 patch).
+- Separately, the SSH-bastion role surfaced its own new bug on inspection
+  of an earlier run: a task named "Enable weak root login and password
+  authentication" used `line: '\1 yes'` - a regex backreference syntax
+  that `ansible.builtin.lineinfile`'s `line:` parameter does not support
+  (backreferences only work in `regexp:`; `line:` is written literally).
+  Applied for real, this task would write the literal string `\1 yes`
+  into `sshd_config`, not `PermitRootLogin yes` - a claim that would
+  silently fail its own stated purpose. This is exactly the kind of gap
+  verify-vulnerabilities (below) exists to catch automatically instead of
+  requiring someone to notice it by reading generated YAML.
+
+So: real breadth, real structurally-distinct output for genuinely
+different specs - and two new, real, reproducible LLM-output bugs found
+in the process of proving it, neither of which is an infrastructure
+problem. Both are left as documented findings rather than "fixed" -
+fixing LLM output reliability broadly is corpus/prompt-engineering work
+for a future week, not something to patch reactively per bug found this
+week without turning into exactly the kind of gold-plating this project
+has consistently avoided.
+
+### verify-vulnerabilities: closing the claim-vs-reality gap for real
+
+The RAG prompt (`prompts.py`) has always asked the LLM for a second part
+beyond the YAML task list: an "Applied misconfigurations" section, one
+claim per line. Until this week that text was generated, shown to the
+user in the CLI transcript, and then discarded - never written to disk,
+never checked against anything. `provision_spec()` now persists both the
+original spec text (`spec.txt`) and the full raw LLM output
+(`generation.md`) into every run directory, which is what makes checking
+a run's claims possible after the fact at all (runs from before this
+week don't have these files, and `verify-vulnerabilities` says so clearly
+rather than pretending to check them).
+
+`validate/vulnerabilities.py` does the checking:
+
+1. **Parse** the "Applied misconfigurations" section into individual
+   claims. The header's exact punctuation and the list marker (`1.` vs
+   `-`) are not consistent across real generations - confirmed by seeing
+   both `**Applied misconfigurations:**` and `**Applied
+   misconfigurations**:` from the *same* spec run twice - so both are
+   tolerated.
+2. **Match** each claim to the specific task that's supposed to apply it.
+   The prompt was tweaked this week to ask the LLM to quote the exact
+   directive/line in backticks per claim (e.g. `` `PermitRootLogin yes` ``)
+   - and, on real generations after the change, it mostly complied: the
+   SSH-bastion run's claims backtick-quoted `Port 2222` and
+   `PermitRootLogin yes` directly, both of which matched their
+   `lineinfile` tasks' `line:` values exactly. Matching is deliberately
+   only against `lineinfile` tasks' literal `line:` value - the one
+   place a claim and a task are meant to say the exact same string -
+   not fuzzy text similarity against prose.
+3. **Boot, check, and attribute.** Matched claims become `DerivedCheck`s
+   fed straight into the *existing* `test_deploy()` machinery from week
+   5 - same boot/verify/destroy cycle, same `parse_task_attribution()`
+   reading Ansible's own `changed`/`ok` output. No new boot/verify
+   machinery was built; this module is entirely a new front end onto the
+   one that already existed.
+4. **Report every claim, not just the checkable ones.** A claim that
+   matches no `lineinfile` task is reported `NOT VERIFIABLE` with an
+   explicit reason, never silently dropped. This turned out to matter in
+   practice, not just in principle: the Telnet/firewall run's three
+   claims all named their *task*, not a config value, in backticks (e.g.
+   `` `Install telnet server (deliberate misconfiguration)` ``) - and
+   none of its tasks were `lineinfile` at all (`package`, `ufw` instead).
+   All three come back `NOT VERIFIABLE`, correctly, because there is
+   nothing here checkable by the current mechanism. Likewise, the
+   audit-logging run's second claim (`0777` permissions on a shared
+   directory) is real and true but expressed via `ansible.builtin.file`'s
+   `mode:`, not `lineinfile` - also `NOT VERIFIABLE`, for the same
+   honest reason, sitting right next to a `authpriv.none` claim from the
+   *same run* that matched and verified cleanly. Coverage is per-claim,
+   not per-run: a run can have both a fully checkable claim and an
+   honestly-unverifiable one at the same time, and the report says so
+   for each individually rather than reducing a whole run to one verdict.
+
+This generalizes the ad-hoc manual SSH checks from week 3/4 by
+construction (it reads whatever claims a given run's own generation
+happened to produce), not by design intent alone - the Telnet/firewall
+and audit-logging runs above are non-SSH proof of that, not just an
+argument for it. What it does **not** yet do: verify claims expressed
+through any module besides `lineinfile` (`file` mode/ownership, `ufw`
+rules, `user` password strength, `package` presence-as-vulnerability).
+Extending coverage module-by-module is real, bounded future work, not
+attempted this week - `lineinfile` covers every claim seen so far that
+has an unambiguous single "did this take effect" check, and reporting
+the rest as `NOT VERIFIABLE` rather than guessing at a check for e.g. a
+`ufw` policy is the more honest choice for a first version of this
+command.
+
+`aggregate_reports()` gained a matching `vulnerability_claims` stat
+(claimed → verifiable → true-on-VM → attributed), the same shape as week
+5's `artefact_checks` stat, feeding the same evaluation summary.
+
+### The audit: storylines were decoupled from the VMs they described
+
+The honest answer to the question this week opened with: **yes, they
+were decoupled.** Reading `forensics/orchestrator.py` and
+`scenarios.py` again with this specific question in mind (rather than
+"does a storyline plant artefacts onto *a* VM," which was already true
+and is a different, weaker claim): `provision_storyline()` feeds a
+storyline's `base_spec` into the same `generate_vm_spec()` every other
+run uses - so the VM itself is generated fresh, same as any run - but
+each storyline's `artefacts` list was fixed Python data, written once at
+authoring time in `scenarios.py`, with zero dependency on what that
+particular generation actually produced. A `departing-employee-
+exfiltration` storyline's entry-vector artefact (an off-hours SSH login)
+was never checked against whether the VM generated for its `base_spec`
+("Ubuntu workstation for a corporate employee...") had SSH weakened at
+all - it was just always the same login-based narrative, regardless of
+what got generated. For idea 3's own framing - "forensic scenario for
+the generated VM," not a separate track running in parallel next to it -
+that is a real gap, not a cosmetic one: a storyline could describe an
+intrusion through a door that particular VM never actually had.
+
+### Wiring: `storyline_builder.py`, entry vectors from verified claims
+
+`forensics/storyline_builder.py` closes this for the one thing a
+narrative most needs to get right: how the "attacker" got in.
+`build_storyline_from_vulnerabilities()` takes a run's own
+`VulnerabilityReport` (from `verify_vulnerabilities()` above) and:
+
+- Picks the **first finding that is verifiable, true on the live VM, and
+  attributed to this run's own role** (`attribution == "changed"`) as
+  the entry vector. A claim that's merely `"ok"` - true, but already true
+  before this run applied anything - does not qualify, on purpose: using
+  one anyway would repeat the exact week 3 `PermitRootLogin` mistake one
+  layer up, just inside a narrative instead of a validation report. No
+  qualifying finding means `build_storyline_from_vulnerabilities()`
+  raises rather than falling back to a generic, spec-decoupled story -
+  the same "close it or park it, don't leave it silent" standard this
+  whole thread has followed since week 5's attribution work.
+- **Classifies** the entry vector by keyword against the claim text,
+  its directive, and its task name (SSH / Telnet / database / firewall /
+  a generic fallback naming the claim directly), and builds a narrative
+  sentence and a log-line artefact (`generators.service_log_entry()`,
+  generalized this week from the SSH-only `auth_log_entry()`) specific
+  to that service - not a hardcoded `sshd` line regardless of what the
+  actual entry vector was.
+- Leaves what happens *after* entry generic (archiving data, copying it
+  off, clearing history) - reusing the same `generators.py` functions
+  `scenarios.py`'s hand-authored storylines already used. That part of
+  the story genuinely doesn't depend on which specific misconfiguration
+  let the attacker in, so genericity there isn't the same kind of gap.
+
+The three original `scenarios.py` demo storylines are unchanged and kept
+- they remain useful, deliberately varied narrative examples, and are
+now honestly documented (here and in their own module docstring) as
+hand-authored rather than run-derived. `storyline_builder.py` is the new,
+additional path that actually closes the point-3 gap: a
+`forensic-scenario-from-run <run_dir>` CLI command runs
+`verify-vulnerabilities`, builds a storyline from the result, plants it,
+and writes a `storyline.json` manifest (`Storyline`/`Artefact` are
+already plain dataclasses; `save_storyline()`/`load_storyline()` just
+(de)serialize them) that `test-deploy --storyline-file` can verify
+against - the same `derive_checks_from_storyline()` / attribution /
+blockinfile-batching machinery from week 5, unchanged, now reachable for
+a storyline that isn't one of the three fixed demo ids.
+
+### Live results: what three real, distinct runs actually did
+
+Everything above (claim parsing, claim-to-task matching, entry-vector
+classification, the "no qualifying claim → refuse" guard) is exercised by
+unit tests against real, freshly-generated LLM output
+(`tests/test_vulnerabilities.py`), not just hand-written fixtures. Three
+of the runs from the corpus-breadth section above were then taken through
+the full live cycle - `test-deploy`, `verify-vulnerabilities`,
+`forensic-scenario-from-run`, `test-deploy --storyline-file` - on the
+user's own elevated terminal (Hyper-V, as every live boot has needed
+since week 3).
+
+**SSH bastion: the full chain worked, and live testing caught a real bug
+in the process.** `test-deploy` booted and verified all four config
+checks, including `PermitRootLogin yes` reporting attribution `"ok"` -
+the box already had it, not attributable to this run, the exact week 3
+finding reproducing again on a completely independent run one release
+later. `verify-vulnerabilities` matched both claims (`Port 2222`,
+`PermitRootLogin yes`) and reported them correctly: `Port 2222` true and
+attributed (`"changed"`), `PermitRootLogin yes` true but *not*
+attributed (`"ok"`) - so `forensic-scenario-from-run` correctly picked
+`Port 2222` as the only qualifying entry vector. But the *narrative text*
+it generated still read "deliberately applied a weak SSH login (root
+login and/or password authentication left enabled)" - describing the
+disqualified claim, not the one that actually qualified. The
+category-level description text (`_ENTRY_VECTORS` in
+`storyline_builder.py`) had been written specifically enough that it
+happened to describe `PermitRootLogin`, and got attached to *any* SSH
+match regardless of which SSH claim actually qualified. This is exactly
+the kind of bug this project's whole live-testing discipline exists to
+catch - a unit test checking "does an SSH claim classify as SSH" would
+never have caught it, because the bug was in what the *description*
+claimed, not in the classification itself. Fixed the same day: the
+category description is now deliberately generic ("a weakened SSH
+configuration"), and the narrative separately quotes the specific
+qualifying claim (`entry.directive`) by name, so it can never assert a
+sub-detail the data didn't verify. A regression test
+(`test_build_storyline_narrative_names_the_actual_verified_claim_not_just_its_category`)
+was added against this exact scenario. The storyline was then
+re-derived (from the same real, already-verified findings the live run
+produced - not a new boot) with the fix in place; the corrected narrative
+now reads "...applied a weakened SSH configuration - specifically, 'Port
+2222'...". The already-planted, already-verified artefacts
+(`artefacts_verified: True`, all 4 checks matched and attributed) were
+unaffected by the bug - it lived only in the narrative/manifest text, not
+in what got planted or how it was checked - so nothing needed replanting.
+
+Also worth noting plainly: the claims list matched here (`Port 2222`,
+`PermitRootLogin yes`) did not include `PasswordAuthentication yes` -
+which the role also set, and which *did* verify as attributable
+(`"changed"`) in the plain `test-deploy` run. The LLM's own "Applied
+misconfigurations" section under-claimed relative to what its own role
+actually did. `verify-vulnerabilities` and the storyline it feeds are
+scoped to checking what the LLM *said* it applied, not auditing
+everything a role does looking for candidate vulnerabilities - a
+reasonable, deliberate scope boundary, but one this run makes concrete
+rather than hypothetical.
+
+**Audit-logging/permissions: two real, distinct boot failures, neither
+in this project's own code.** First attempt failed inside the Ansible
+run itself: a task named "Ensure shared directory is owned by root" used
+`ansible.builtin.user` with a `path:` parameter - not a parameter that
+module supports (`path:` belongs to `ansible.builtin.file`; the LLM
+seems to have confused the two modules for a directory-ownership task).
+A third distinct LLM-output bug this week, joining the Postgres
+quote-nesting failure and the SSH `\1`-backreference bug in the same
+"generated content that doesn't do what it claims" category - none of
+these are fixed in code, deliberately, since fixing generation reliability
+broadly is corpus/prompt work, not something to patch one bug at a time
+as they're found. `verify-vulnerabilities`' own output on this run is
+worth highlighting on its own merits, though: it correctly reported the
+one matchable claim (`authpriv.none`) as unable to be checked ("the VM
+never reached this check - boot likely failed before checks ran") rather
+than a false pass or a crash, and correctly left the `0777`-permissions
+claim `NOT VERIFIABLE` (that claim is expressed via `ansible.builtin.file`'s
+`mode:`, a module this version doesn't cover) - both honest, both
+distinguishable from each other in the same report. The *second* attempt
+(re-running `verify-vulnerabilities`) failed for a completely unrelated
+reason before Ansible even ran: `add-apt-repository ppa:ansible/ansible`
+resolved to the non-existent `ppa:~ansible/ubuntu/ansible` on the guest -
+a transient Launchpad PPA-resolution hiccup in `ansible_local`'s own
+install-Ansible-on-first-use logic, unrelated to anything this project
+generates or controls. Two failures, two unrelated causes, both correctly
+surfaced with a real error rather than a silent hang or a false result -
+consistent with `test_deploy()`'s error-capture behaviour holding up
+under a failure mode nobody had hit before this run.
+`forensic-scenario-from-run` correctly refused to build a storyline for
+this run (no claim both verified and attributed) rather than guessing.
+
+**Telnet/firewall: booted cleanly, confirming the "nothing checkable"
+result from static analysis reflects the role's actual content, not a
+gap in reading it.** `test-deploy` reported `config_verified: None` (no
+`lineinfile` tasks exist to derive checks from) and otherwise booted and
+provisioned without error - a real, different VM (Telnet installed, UFW
+configured) coming up successfully, just with nothing the current
+mechanism can check. This matches exactly what `verify-vulnerabilities`
+had already reported without booting at all (all three claims `NOT
+VERIFIABLE`, since none reference a `lineinfile` task) - the static
+read and the live boot agree, which is itself a small but real piece of
+evidence that the "not verifiable" determination isn't a false negative.
+
+### The combined evaluation, across all eight runs so far
+
+`report-summary` now aggregates week 5's five runs and week 6's three
+new ones together (a `checkov`/`molecule`/`scans` field of `None` - the
+fallback `verify-vulnerabilities`/`forensic-scenario-from-run` write
+when no `report.json` exists yet for a run - turned out to crash
+`aggregate_reports()` on first real use this week: `.get("scans", {})`
+only supplies its default for a *missing* key, not one present with
+value `None`. A fourth real bug this week, this time in this project's
+own code rather than generated content - fixed with `(r.get("scans") or
+{})`, with a regression test):
+
+```
+total_runs: 8
+checkov:                         5/5 applicable  (1.0)
+ansible_lint:                    3/5 applicable  (0.6)
+molecule:                        0/5 applicable  (0.0)
+test_deploy_booted:               5/7 applicable  (0.71)
+test_deploy_config_verified:      3/3 applicable  (1.0)
+test_deploy_artefacts_verified:   1/3 applicable  (0.33)
+artefact_checks:      16 total, 12 matched (0.75), 16/16 attributed (1.0)
+vulnerability_claims:  7 total claims
+  verifiable:                     3/7   (0.43)
+  true on the VM (of verifiable): 2/3   (0.67)
+  attributed (of true):           1/2   (0.5)
+```
+
+Read together with the per-run detail above, this is a coherent, honest
+picture rather than a single pass/fail number: `test_deploy_booted`
+dropping to 0.71 is the audit-logging run's two real failures, not a
+regression in anything that worked before. `test_deploy_artefacts_verified`
+at 0.33 (1 of 3 forensic runs fully verified) reflects that only the SSH
+run reached the artefact-planting stage this week - the audit-logging
+run never got a qualifying entry vector to build a storyline around, and
+that's the system correctly refusing rather than a failure to reach
+100%. The `vulnerability_claims` numbers are the new, central result for
+point 2 of this week's brief: of 7 real claims across three genuinely
+different specs, 3 were checkable by the current (`lineinfile`-only)
+mechanism, 2 of those were actually true on a live VM, and of those, only
+1 was attributable to the run that claimed it - the other being the
+`PermitRootLogin` "already true, not our doing" case this whole feature
+exists to catch. A single run producing one attributable claim and one
+non-attributable one, both correctly distinguished, is a small sample,
+but it is a *real, live-verified* sample rather than an assertion the
+mechanism works.
+
 ## Libraries and tools
 
 - **FastAPI** — the HTTP interface (`POST /generate`). Chosen over Flask
@@ -1462,20 +1820,49 @@ once the Packer box is actually wired in (still not wired in as of week
 scenario uses (hosted runners support it natively); **WSL2** is what
 `ansible-lint`/Molecule run inside of locally, on Windows.
 
-## Known limitations going into week 6
+## Known limitations going into week 7
 
-- The knowledge corpus covers the SSH pentesting example thoroughly but not
-  other scenario families yet. Week 5 made this concrete rather than
-  theoretical: varying a forensic storyline's `base_spec` wording (a
-  corporate workstation, an internal file server, a dev VM with a shared
-  repo) did not broaden what actually got generated - roles still came
-  back SSH-flavoured regardless, and the one storyline whose spec strayed
-  furthest from SSH-pentesting territory ("development VM with a shared
-  project repository") produced content that didn't survive a live boot
-  at all (an assumed-but-nonexistent "ubuntu" user; on a re-roll, an
-  undefined Jinja2 variable and a fabricated GitHub URL). Real breadth
-  needs broader corpus content - a future week's work, not something
-  phrasing alone was ever going to solve.
+- The knowledge corpus's *breadth* is no longer the open question week 5
+  left it as - week 6 proved genuinely distinct specs produce genuinely
+  distinct roles (SSH bastion, Telnet/firewall, audit-logging/permissions,
+  an attempted database spec - see the week 6 section above), not the
+  same SSH content reskinned. What week 6 exposed instead is a *reliability*
+  gap sitting behind that breadth: of four distinct specs tried, one
+  failed to parse as YAML twice in a row (an unescaped `'*'` nested in a
+  quoted PostgreSQL directive), and a second produced a role that failed
+  to apply live (an `ansible.builtin.user` task using a `file`-module-only
+  `path:` parameter). Two of four fresh generations this week had a real,
+  reproducible content bug, on top of the SSH role's own `\1`-backreference
+  bug found by inspection. This is a more precise version of the old
+  "corpus is too narrow" limitation: the corpus retrieves the right
+  *topic* reliably now, but the LLM's ability to correctly operate the
+  Ansible module it picks for that topic is inconsistent, and inconsistent
+  in a different way for each spec so far - not a single fixable bug.
+- verify-vulnerabilities (week 6) only checks claims expressed via
+  `ansible.builtin.lineinfile`'s `line:` value - the one place a claim and
+  a task are guaranteed to say the same string. Real runs this week
+  produced claims about `ufw` policy, `ansible.builtin.file` permissions,
+  and task names quoted verbatim in place of a directive - all correctly
+  reported `NOT VERIFIABLE`, none silently dropped, but none checkable
+  either. Extending coverage module-by-module is bounded future work, not
+  attempted this week - see the week 6 section for the reasoning.
+- verify-vulnerabilities and the storylines built from it are scoped to
+  what the LLM's own "Applied misconfigurations" section *claimed*, not
+  everything a role's tasks actually do. The SSH bastion run this week
+  made this concrete: `PasswordAuthentication yes` was real, live-verified,
+  and attributable (`"changed"`) in a plain `test-deploy` run, but was
+  never claimed in generation.md at all, so it was invisible to
+  verify-vulnerabilities and never eligible as a storyline's entry
+  vector. The LLM under-claims sometimes, not just over-claims/hallucinates
+  - a real, distinct failure direction from the ones week 5 and 6 had
+  already found.
+- There is no cache-invalidation check between `knowledge/` and the
+  persisted `.chroma/` store — edits to the corpus require deleting
+  `.chroma/` by hand.
+- There is no automated comparison metric between grounded and ungrounded
+  output yet, only the ability to produce both for the same spec; building
+  an actual evaluation metric is deferred to the dissertation's evaluation
+  chapter.
 - There is no cache-invalidation check between `knowledge/` and the
   persisted `.chroma/` store — edits to the corpus require deleting
   `.chroma/` by hand.
@@ -1541,7 +1928,38 @@ scenario uses (hosted runners support it natively); **WSL2** is what
   is a related, separate gap, not fixed this week - a real operational
   consideration for any future automated/repeated test-deploy runs.
 - `forensicforge validate`, run a second time after `test-deploy`, used to
-  silently destroy the recorded `test_deploy` results (fixed this week -
-  see the dedicated bug list above) - flagged here as a reminder that the
-  fix is new and not yet exercised across many repeated validate/test-deploy
-  cycles in sequence.
+  silently destroy the recorded `test_deploy` results (fixed week 5) -
+  flagged here as a reminder that the fix is not yet exercised across many
+  repeated validate/test-deploy cycles in sequence.
+- `aggregate_reports()` crashed (`AttributeError`) on any report.json with
+  `scans`/`molecule` explicitly `None` - the fallback dict
+  `verify-vulnerabilities`/`forensic-scenario-from-run` write when no
+  report.json exists yet for a run. `.get("scans", {})`'s default only
+  applies to a *missing* key, not a present one holding `None`. Fixed
+  this week (`(r.get("scans") or {})`) with a regression test - the first
+  bug this week found in this project's own code rather than in LLM-
+  generated content, and found by running the CLI end-to-end against real
+  runs rather than by code review or unit tests alone.
+- `storyline_builder.py`'s per-category entry-vector description
+  (`_ENTRY_VECTORS`) was, until a live run caught it, specific enough to
+  assert details ("root login and/or password authentication left
+  enabled") that a *particular* qualifying claim within that category
+  hadn't actually verified - see the week 6 live-results section above
+  for the exact run that surfaced this. Fixed by making the category
+  description generic and having the narrative separately name the
+  specific verified claim; a regression test was added. Worth flagging
+  as a class of bug, not just an instance: any future addition to
+  `_ENTRY_VECTORS` needs to stay generic at the category level for the
+  same reason, since the fix pattern (name the specific claim separately)
+  isn't structurally enforced - a future contributor could reintroduce
+  the same mistake for a new category without the regression test
+  covering it (it only covers SSH).
+- The audit-logging run's two consecutive live-boot failures (a real
+  `ansible.builtin.user`/`path:` content bug, then an unrelated transient
+  Launchpad PPA-resolution failure on retry) meant no second forensic
+  storyline was built end-to-end this week beyond the SSH one - the
+  point-3 wiring is demonstrated for exactly one run, live, not several.
+  The refuse-rather-than-fake behaviour when no claim qualifies is itself
+  now live-verified (this run hit it for real), which is a real, useful
+  result on its own, but a second successful full chain (ideally through
+  a non-SSH entry vector, since the SSH one already worked) remains open.

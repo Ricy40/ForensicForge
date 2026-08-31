@@ -285,6 +285,23 @@ def test_write_and_load_report_round_trip(tmp_path):
     assert loaded == report
 
 
+def test_aggregate_reports_tolerates_scans_and_molecule_being_none(tmp_path):
+    """Regression test: verify-vulnerabilities/forensic-scenario-from-run
+    fall back to {"scans": None, "molecule": None, ...} when no report.json
+    exists yet for a run (they don't run checkov/ansible-lint/molecule
+    themselves) - confirmed by hitting an AttributeError running
+    report-summary for real against exactly such a run."""
+    run_dir = tmp_path / "run1"
+    run_dir.mkdir()
+    write_report({"run_id": "run1", "scans": None, "molecule": None, "test_deploy": None}, run_dir)
+
+    summary = aggregate_reports(tmp_path)
+
+    assert summary["checkov"] == {"passed": 0, "applicable": 0, "rate": None}
+    assert summary["ansible_lint"] == {"passed": 0, "applicable": 0, "rate": None}
+    assert summary["molecule"] == {"passed": 0, "applicable": 0, "rate": None}
+
+
 def test_aggregate_reports_computes_pass_rates(tmp_path):
     def make_report(run_id: str, checkov_passed: bool, test_deploy_booted: bool | None):
         run_dir = tmp_path / run_id

@@ -37,6 +37,13 @@ def provision_spec(spec: str, role_name: str = "training_vm") -> ProvisionResult
 
     run_id = make_run_id()
     run_dir = config.GENERATED_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persisted so verify-vulnerabilities (week 6) can check this run's own
+    # claimed misconfigurations later, without needing the original
+    # generate_vm_spec() call still in memory - see docs/METHODOLOGY.md.
+    (run_dir / config.SPEC_FILENAME).write_text(spec, encoding="utf-8")
+    (run_dir / config.GENERATION_FILENAME).write_text(result.output, encoding="utf-8")
 
     role_dir = write_ansible_role(result.output, run_dir, role_name=role_name)
     vagrantfile = write_vagrantfile(run_dir, hostname=f"forensicforge-{run_id}")

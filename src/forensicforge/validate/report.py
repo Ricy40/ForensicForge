@@ -81,9 +81,18 @@ def aggregate_reports(generated_dir: Path = config.GENERATED_DIR) -> dict:
 
     return {
         "total_runs": total,
-        "checkov": _rate(lambda r: r.get("scans", {}).get("checkov", {}).get("passed")),
-        "ansible_lint": _rate(lambda r: r.get("scans", {}).get("ansible_lint", {}).get("passed")),
-        "molecule": _rate(lambda r: r.get("molecule", {}).get("passed")),
+        # `or {}`, not `.get(X, {})`: a report written by a command that
+        # hasn't run `validate` yet (verify-vulnerabilities,
+        # forensic-scenario-from-run - both fall back to a fresh
+        # {"scans": None, "molecule": None, ...} dict if no report.json
+        # exists) has these keys *present* with value None, not missing -
+        # `.get(X, {})`'s default never triggers for a present-but-None
+        # key, so it returned None instead of {} and crashed the next
+        # .get() in the chain. Confirmed by hitting exactly this running
+        # report-summary against real week 6 runs. See docs/METHODOLOGY.md.
+        "checkov": _rate(lambda r: (r.get("scans") or {}).get("checkov", {}).get("passed")),
+        "ansible_lint": _rate(lambda r: (r.get("scans") or {}).get("ansible_lint", {}).get("passed")),
+        "molecule": _rate(lambda r: (r.get("molecule") or {}).get("passed")),
         "test_deploy_booted": _rate(lambda r: (r.get("test_deploy") or {}).get("booted")),
         "test_deploy_config_verified": _rate(
             lambda r: (r.get("test_deploy") or {}).get("config_verified")
@@ -103,6 +112,14 @@ def aggregate_reports(generated_dir: Path = config.GENERATED_DIR) -> dict:
         # and "how reliably does artefact planting work overall" are
         # different questions. See docs/METHODOLOGY.md (week 5).
         "artefact_checks": _artefact_check_stats(reports),
+        # Per-claim, across every run with a "vulnerabilities" section
+        # (verify-vulnerabilities): of everything the generation step
+        # claimed to have applied, how much was actually checkable live,
+        # how much of what was checkable turned out true, and of what was
+        # true, how much is actually attributable to this run's own role
+        # rather than a pre-existing default. See docs/METHODOLOGY.md
+        # (week 6).
+        "vulnerability_claims": _vulnerability_claim_stats(reports),
     }
 
 
@@ -122,4 +139,25 @@ def _artefact_check_stats(reports: list[dict]) -> dict:
         "match_rate": (matched / total) if total else None,
         "attributed_to_this_run": attributed,
         "attribution_rate": (attributed / total) if total else None,
+    }
+
+
+def _vulnerability_claim_stats(reports: list[dict]) -> dict:
+    all_findings = [
+        finding
+        for report in reports
+        for finding in (report.get("vulnerabilities") or {}).get("findings", [])
+    ]
+    total = len(all_findings)
+    verifiable = [f for f in all_findings if f.get("verifiable")]
+    true_on_vm = [f for f in verifiable if f.get("actual")]
+    attributed = [f for f in true_on_vm if f.get("attribution") == "changed"]
+    return {
+        "total_claims": total,
+        "verifiable": len(verifiable),
+        "verifiable_rate": (len(verifiable) / total) if total else None,
+        "true_on_vm": len(true_on_vm),
+        "true_rate_of_verifiable": (len(true_on_vm) / len(verifiable)) if verifiable else None,
+        "attributed_to_this_run": len(attributed),
+        "attribution_rate_of_true": (len(attributed) / len(true_on_vm)) if true_on_vm else None,
     }

@@ -1,13 +1,17 @@
 from .orchestrator import ForensicProvisionResult, provision_storyline
 from .planter import ARTEFACT_ROLE_NAME, derive_checks_from_storyline, write_artefact_role
-from .storyline import Artefact, Storyline
+from .storyline import Artefact, Storyline, load_storyline, save_storyline
+from .storyline_builder import build_storyline_from_vulnerabilities
 
 __all__ = [
     "ARTEFACT_ROLE_NAME",
     "Artefact",
     "ForensicProvisionResult",
     "Storyline",
+    "build_storyline_from_vulnerabilities",
     "derive_checks_from_storyline",
+    "load_storyline",
     "provision_storyline",
+    "save_storyline",
     "write_artefact_role",
 ]
