@@ -69,38 +69,56 @@ Vagrant.configure("2") do |config|
   # thing between "what's on disk here" and "what the guest sees", so
   # forcing a clean destination removes whatever staleness mechanism was
   # responsible rather than requiring one to be pinned down first.
-  config.vm.provision "shell", inline: "mkdir -p {provisioning_path} && rm -rf {provisioning_path}/roles", privileged: false
+  # Ansible is installed here, explicitly, in this project's own shell
+  # provisioner - not left to ansible_local's own install logic below.
+  # Four different attempts at letting Vagrant/apt handle this failed
+  # live, each a different way: the default install_mode's PPA add
+  # (`add-apt-repository ppa:ansible/ansible`) failed with a Launchpad
+  # team-resolution error, independently, on two separate runs; switching
+  # to install_mode "pip" then failed because its default bootstrap
+  # (get-pip.py) has dropped support for anything older than Python 3.10
+  # (this box ships 3.8); a version-pinned get-pip.py URL fixed *that*,
+  # but Vagrant's own subsequent `pip install --upgrade ansible` step
+  # (hardcoded, not something this project's Vagrantfile controls) then
+  # failed with "pip: command not found"; installing the plain `ansible`
+  # apt package directly (confirmed published in focal's universe
+  # component via Launchpad's package API) sidestepped all of that, but
+  # is version 2.9.6 (from 2020) - which predates Ansible's collections
+  # system entirely, so it can't resolve `community.general.ufw` (or any
+  # other collection-qualified module name) at all. Every generated role
+  # that uses `ufw` - most of them, via the knowledge corpus's own
+  # ansible_tasks/manage_ufw_firewall_rule.md - would fail the same way.
+  # Fixed by installing a modern Ansible via pip3 instead of apt's
+  # ancient package: `python3-pip` (the apt package, not get-pip.py -
+  # sidesteps that whole Python-version problem, since it's prebuilt for
+  # this exact box's Python) gets a working pip3, then `pip3 install
+  # ansible` - deliberately the full `ansible` PyPI package, not the
+  # minimal `ansible-core` - since the full package bundles a curated set
+  # of collections (community.general included) that ansible-core alone
+  # does not, which is exactly what this project's generated roles need.
+  # See docs/METHODOLOGY.md (week 6) for the full chain of attempts.
+  #
+  # python3-pymysql and python3-psycopg2 (confirmed published in focal's
+  # archive via Launchpad's package API, not assumed) are installed
+  # unconditionally alongside Ansible itself, not only when a generated
+  # role happens to need one: Ansible's `mysql_user`/`postgresql_user`
+  # modules (and similar) need a Python DB driver present on the *guest*
+  # to connect at all - confirmed live, a database-misconfiguration spec
+  # failed with "A MySQL module is required" on a `mysql_user` task with
+  # nothing on the guest to satisfy it. Deterministic given the module
+  # choice (not stochastic like the earlier bugs above), and this
+  # project's knowledge corpus/generated roles will keep hitting it for
+  # any future database spec, MySQL or Postgres - cheap (a few MB) to
+  # install preemptively versus detecting per-role which driver a
+  # specific run's tasks would need.
+  config.vm.provision "shell", inline: "mkdir -p {provisioning_path} && rm -rf {provisioning_path}/roles && sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip python3-pymysql python3-psycopg2 && sudo pip3 install --quiet ansible", privileged: false
   config.vm.provision "file", source: "playbook.yml", destination: "{provisioning_path}/playbook.yml"
   config.vm.provision "file", source: "roles", destination: "{provisioning_path}/roles"
 
   config.vm.provision "ansible_local" do |ansible|
     ansible.playbook = "playbook.yml"
     ansible.provisioning_path = "{provisioning_path}"
-    # Default install_mode uses `add-apt-repository ppa:ansible/ansible`
-    # to get a newer Ansible than Ubuntu's own repos ship. That PPA add
-    # failed live, independently, on two different runs this week with
-    # the same error ("Cannot add PPA: 'ppa:~ansible/ubuntu/ansible' ...
-    # '~ansible' user or team does not exist") - not this project's code,
-    # but frequent enough (2 of a handful of live boots) to be worth
-    # avoiding rather than just retrying past. "pip" installs Ansible
-    # from PyPI instead, bypassing the PPA (and Launchpad) entirely -
-    # confirmed a real install_mode option, not assumed, against
-    # HashiCorp's own ansible_local provisioner docs. See
-    # docs/METHODOLOGY.md (week 6).
-    ansible.install_mode = "pip"
-    # install_mode "pip"'s own default pip_install_cmd
-    # (`curl https://bootstrap.pypa.io/get-pip.py | sudo python`) failed
-    # live on this box (generic/ubuntu2004, Python 3.8): get-pip.py
-    # dropped support for anything older than Python 3.10, and its own
-    # error output names the fix - a version-pinned URL
-    # (bootstrap.pypa.io/pip/3.8/get-pip.py) instead of the generic one.
-    # `pip_install_cmd` is confirmed a real, documented override (not
-    # assumed) against HashiCorp's own docs. Keeps the same `python`
-    # invocation the box already proved resolves (the failing run got far
-    # enough to run get-pip.py itself and have *it* reject the Python
-    # version - "python" was never the problem). See docs/METHODOLOGY.md
-    # (week 6).
-    ansible.pip_install_cmd = "curl https://bootstrap.pypa.io/pip/3.8/get-pip.py | sudo python"
+    ansible.install = false
   end
 end
 """

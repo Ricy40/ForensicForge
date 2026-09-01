@@ -1975,6 +1975,350 @@ time - a real boot failure showed as `N/A` with a clear note and the
 actual `vagrant up` error, not a misleading `FALSE`. One fewer thing to
 debug blind next time.
 
+### Getting Ansible onto the guest reliably: the third and (so far) final attempt
+
+Starting the seven-scenario evaluation batch (below) hit a *third*
+distinct failure in the same "install Ansible on the guest" chain, on
+the FTP/vsftpd spec. The `install_mode = "pip"` fix from the previous
+section got further than before - its pinned `pip_install_cmd`
+bootstrapped pip successfully this time (`Installing pip... (for
+Ansible installation)` completed without error) - but the very next
+step, `ansible_local`'s own hardcoded `pip install --upgrade ansible`,
+failed with `pip: command not found`. The freshly-installed pip wasn't
+resolvable as a bare `pip` on whatever `PATH` that specific step ran
+with - plausibly a `sudo`/non-login-shell `PATH` gap, never fully
+root-caused, since a fourth workaround chasing the exact `PATH` Vagrant's
+internal step uses would just be another guess in the same failing
+direction.
+
+Instead of a fourth variant of "get pip working," the whole approach
+changed: rather than let `ansible_local` install Ansible at all, install
+it directly via plain `apt-get install -y ansible` in this project's own
+shell provisioner (which already runs before `ansible_local`), and set
+`ansible.install = false` so `ansible_local` never attempts its own
+install logic - PPA, pip, or otherwise. This was checked properly before
+relying on it, given how many guesses in this general area had already
+failed: Launchpad's own package API (`getPublishedBinaries` against the
+Ubuntu archive) confirms `ansible` 2.9.6+dfsg-1 is published in `focal`'s
+`universe` component, no PPA required.
+
+**Retested live - two more findings, one transient, one real.** First
+retry hit a plain network blip (`apt-get update` failing DNS resolution
+for every mirror at once, right at boot) - didn't recur on a second
+retry, confirming it was a one-off rather than anything this project's
+Vagrantfile causes. The second retry got past that and *actually
+installed* `ansible` 2.9.6 via apt successfully - but then failed for a
+real, structural reason: 2.9.6 (from 2020) predates Ansible's collections
+system entirely, so it can't resolve `community.general.ufw` - or any
+other collection-qualified module name - at all. Every generated role
+using `ufw` (most of them; `ansible_tasks/manage_ufw_firewall_rule.md` is
+a core knowledge-corpus entry) would fail the same way. The apt-based fix
+avoided the PPA/pip problems but traded them for an Ansible too old to
+run this project's own generated content - not a fix, just a different
+failure mode.
+
+Fixed - hopefully for the last time in this saga - by installing a
+*modern* Ansible via `pip3` instead of apt's package: `apt-get install
+python3-pip` (not `get-pip.py` - sidesteps that Python-version problem
+entirely, since the apt package is prebuilt for the box's own Python)
+gets a working `pip3`, then `pip3 install ansible` - deliberately the
+full `ansible` PyPI package, not the minimal `ansible-core` - since the
+full package bundles a curated set of collections (`community.general`
+included) that `ansible-core` alone does not. This is the fourth attempt
+at this exact problem and, unlike the previous three, addresses the
+actual requirement (a *modern enough* Ansible, not just *an* Ansible)
+rather than another way to install one.
+
+**Retested live - confirmed fixed.** The FTP/vsftpd scenario went all
+the way through on retry: booted, `anonymous_enable=YES` verified true
+and attributed (`"changed"`), storyline built (`Garcia Inc, a small
+catering company, uses this machine to share files with clients and
+suppliers over FTP` - the business-backstory feature, live-verified for
+the first time here too), config and artefacts both verified on the
+final boot, image exported. The pip3/full-`ansible` fix holds.
+
+### A fifth generation bug, caught by the prompt itself inviting it
+
+The web-app-misconfig spec then failed differently: a task using
+`ansible.builtin.template`, referencing a `.j2` file
+(`templates/apache_directory_listing.conf.j2`) that doesn't exist -
+`write_ansible_role()` only ever writes `tasks/main.yml`, never a
+`templates/` directory, so any `template` task is broken by
+construction, regardless of what it contains. The boot got roughly ten
+minutes in (through package installs, several other tasks) before
+failing on it - a real, if not huge, cost paid to discover a bug in a
+place a code review would have caught in seconds. On inspection, the
+cause wasn't subtle: `prompts.py`'s own `RAG_SYSTEM_PROMPT` explicitly
+*listed* `ansible.builtin.template` as an example module, despite the
+pipeline having no mechanism to ever supply the file it needs. The
+prompt itself was inviting exactly the failure it caused.
+
+Fixed two ways, not one: the prompt no longer suggests `template` at all
+and now explicitly instructs against any module that reads a file from
+the controller (`copy`'s `src:` included), directing toward self-
+contained alternatives (`copy` with inline `content:`, `lineinfile`,
+etc.) instead - fixing the cause. And `parse_tasks()` now rejects any
+`ansible.builtin.template` task, or an `ansible.builtin.copy` task using
+`src:` instead of `content:`, immediately at generation time -
+sub-second, no VM boot needed - rather than letting either fail ten
+minutes into a live one, in case an LLM doesn't follow the (now-correct)
+instruction. Verified live: two fresh re-rolls of the same spec after
+the prompt fix both produced fully self-contained roles (`lineinfile` and
+`copy`-with-inline-`content:` only, no `template`, no `src:`) - the
+prompt fix is doing its job, and the fast-fail check is now confirmed
+correct on real generated output, not just the unit-test fixture.
+
+### A sixth and seventh generation bug - and a real gap in the repair mechanism itself
+
+Retesting the web-app-misconfig spec (three fresh re-rolls) found two
+more distinct bugs, live.
+
+**`notify:` with nowhere to resolve.** One re-roll's role used `notify:
+restart apache` on a config-editing task - and failed, mid-boot, with
+`ERROR! The requested handler 'restart apache' was not found`. Same root
+cause as the `template` bug above: `write_ansible_role()` never writes a
+`handlers/main.yml`, so `notify:` can never resolve, structurally,
+regardless of what it names. Unlike `template`, this one has a safe,
+mechanical repair rather than needing outright rejection: every real
+generation using `notify:` this way also included its own explicit,
+unconditional `ansible.builtin.service: state: restarted` task later in
+the same role - as if the LLM added both a handler notification and a
+manual fallback for the same restart. Stripping the `notify:` key
+(`repair_dangling_notify()`) removes only the broken trigger; the config
+change and the actual restart both still happen via the tasks that
+remain. The prompt was also updated to instruct against `notify:`
+directly, for the same reason as `template`: fix the cause, and keep the
+repair as a safety net for when an LLM doesn't follow it.
+
+**A trailing `handlers:` block, and a real gap the *previous* fix
+exposed.** A third re-roll went further: instead of `notify:`, it
+appended a complete `handlers:` section directly after the task list -
+which isn't valid as a single YAML document at all (a top-level sequence
+can't be followed by a top-level mapping key), so it failed before
+`repair_dangling_notify()` ever got a chance to run - PyYAML itself
+never produced a task list to inspect. This exact generation *also* had
+the nested-quote bug from earlier in this document (a `$username =
+'admin'; $password = 'admin123';` line), and that's what actually
+surfaced the real gap: `parse_tasks()` only ever tried one repair-and-
+retry cycle, so fixing the quote issue (which it correctly did) still
+left the `handlers:` block to fail the retry and abort the whole
+generation - a single generation with *two* distinct bugs defeated a
+repair mechanism built to fix them one at a time. Fixed two ways:
+`repair_trailing_handlers_block()` strips the dangling block (same
+"nowhere to resolve it anyway" reasoning as `notify:`), and
+`parse_tasks()` now loops through its repair list up to four times
+rather than once, so multiple distinct issues in the same generation
+each get their own repair-and-retry pass instead of only the first.
+Verified against the exact real raw output that failed live: all three
+repairs (quote fix, handlers-block strip, notify strip) fire in sequence
+and the result parses cleanly, with a regression test covering the same
+combination.
+
+**Web-app-misconfig retested clean** (all fixes above confirmed live in
+one run: two `notify:` repairs applied automatically, config and planted
+evidence both verified, business backstory - "Gonzales-Duncan, a small
+bakery" - rendered correctly). The database spec then hit a different,
+genuinely new kind of failure: a `mysql_user` task (setting a weak root
+password) failed with "A MySQL module is required: ... PyMySQL, or
+MySQL-python, or ... mysqlclient." Ansible's MySQL/PostgreSQL modules
+connect via a Python database driver that has to be present on the
+*guest* they're managing - nothing in this pipeline had ever installed
+one, since no earlier spec's role used a module with this requirement.
+Unlike every fix above, this isn't a bug in generated content at all -
+the task was completely correct Ansible; the guest just lacked a
+dependency it needed. Deterministic given the module choice, not
+stochastic, and certain to recur for any future database spec (this
+session already had an earlier, separate PostgreSQL spec attempt too -
+see the corpus-breadth section above). Fixed by installing
+`python3-pymysql` and `python3-psycopg2` unconditionally alongside
+Ansible itself in the base shell provisioner, rather than detecting
+per-role which driver a specific run's tasks would need - both confirmed
+published in Ubuntu focal's archive via Launchpad's package API before
+relying on them, and cheap enough (a few MB) that installing both
+preemptively is simpler and more robust than conditional detection.
+
+### An infinite hang, not a failure - the same bug class as week 3, one layer deeper
+
+Retrying the database spec with the MySQL/Postgres drivers installed hit
+something worse than any failure so far: no error at all, just silence.
+The terminal sat on "Verifying claimed vulnerabilities" for 10+ minutes
+with zero new log output, while every earlier task had completed in
+seconds. Diagnosed from `vagrant.log` directly (last write timestamp,
+compared against the current time) rather than guessing - confirmed
+genuinely stalled, not just slow, before looking further. The role's own
+tasks named the cause:
+
+```yaml
+- name: Secure MySQL installation
+  ansible.builtin.shell: mysql_secure_installation
+```
+
+`mysql_secure_installation` is an interactive script - it asks a series
+of yes/no questions on a terminal. Ansible's `shell` module runs commands
+with no stdin attached at all, so the script sits forever waiting for
+input that can never arrive. This is exactly the same bug class as the
+very first one this entire project ever hit - the Vagrant Hyper-V
+switch-selection prompt hang, week 3 - just one layer deeper: inside the
+guest's own provisioning this time, not the host's `vagrant up`. Worse
+than every other generation bug found so far, in one specific way: every
+previous one failed loudly, with an error message, somewhere between
+instantly and ~10 minutes in. This one doesn't fail at all - there is no
+timeout, no error, nothing to read except a log that stopped moving.
+
+Fixed the same two ways as `template`/`notify:` above: the prompt now
+explicitly instructs against running any interactive command via
+`ansible.builtin.shell`/`ansible.builtin.command`, naming
+`mysql_secure_installation` specifically and `community.mysql.mysql_user`
+as the correct alternative; and `parse_tasks()` now rejects any
+`shell`/`command` task whose command text contains a known-interactive
+command, immediately at generation time. The known-command list starts
+at exactly one entry (`mysql_secure_installation` - the only confirmed
+live case) rather than guessing at others: a broader match like bare
+`passwd` risks a false positive against a legitimate, genuinely
+non-interactive command (`chpasswd`) that happens to contain the same
+substring - precision over speculative coverage, consistent with this
+project's repair-list philosophy throughout.
+
+**Cleanup note:** the interrupted run left a stale Vagrant lock - a live
+`ruby` process from the interrupted `vagrant up` was still holding the
+machine lock, the same failure mode documented back in week 3. Diagnosed
+via the process listing (matching the lock error's own suggestion) and
+confirmed by timestamp (the process's start time matched the run
+exactly). Killing it needed the user's own elevated terminal - this
+session's own PowerShell access is unelevated and couldn't touch a
+process started elevated, same access boundary as every Hyper-V
+operation throughout this project.
+
+### Confirmed: the interactive-hang fix worked. A different bug replaced it.
+
+The retry never hung - `mysql_secure_installation` didn't reappear;
+this generation used `ansible.builtin.mysql_user` directly instead, as
+the tightened prompt suggested. But it failed a different way: a task
+named "Remove firewall rules that allow external access" used
+`ansible.builtin.firewall`, which doesn't exist anywhere in Ansible -
+not `ansible.builtin`, not any bundled collection, not the wider
+ecosystem. Real modules for this are `community.general.ufw` (Ubuntu) or
+`ansible.posix.firewalld` (RHEL-family) - the knowledge corpus already
+has dedicated ufw guidance
+(`ansible_tasks/manage_ufw_firewall_rule.md`), but this run's own
+retrieved snippets happened not to include it (see the "Retrieved N
+corpus snippets" list in its own output) - leaving the LLM ungrounded
+for that one task, and it invented a module rather than omitting it or
+asking. A genuinely different failure mode from everything else found
+this week: not broken YAML, not a structurally-impossible Ansible
+feature, not a missing guest dependency, but a plainly nonexistent
+module name - closer to classic LLM hallucination than any of the
+others.
+
+Fixed the same two-pronged way as the rest: the prompt now explicitly
+lists `community.general.ufw` as the firewall module to use and
+instructs the model to omit a task rather than invent a module when no
+snippet covers what it needs; `parse_tasks()` rejects a short, explicit
+list of confirmed-nonexistent module names (starting at one entry,
+`ansible.builtin.firewall`) immediately at generation time. Deliberately
+not an attempt to validate against the full space of real Ansible
+modules - that would need actual module introspection (`ansible-doc`),
+not a hardcoded list - just the one confirmed case, same evidence-driven
+scope as every other check in this file.
+
+### The database vulnerability class: a real, evidenced limitation, not a bug to chase
+
+Three consecutive attempts at the database spec surfaced a pattern
+worth recording honestly rather than patching around.
+
+**Attempts 1 and 2** (original spec wording, "weak root password"): both
+retrieved the identical four corpus snippets - deterministic, since
+retrieval is a similarity search over a fixed corpus for the same spec
+text - and two of the four were SSH-focused
+(`weak_ssh_root_login.md`, `sshd_config/permit_root_login.md`), not
+database-focused, evidently because "root password" sits close to
+SSH's own root-login content in embedding space even though the spec
+means MySQL's root password. Both generations then wrote genuinely
+secure SSH tasks (`PermitRootLogin no`, `PasswordAuthentication no`)
+while their "Applied misconfigurations" section claimed the opposite -
+as if describing what the retrieved SSH snippet says rather than what
+the role's own tasks actually do. `verify-vulnerabilities` correctly
+caught both: no claim matched any task's actual content, so both runs
+correctly reported `NOT VERIFIABLE` across the board and never booted at
+all (nothing checkable to boot for) - the mechanism worked exactly as
+designed, at zero live-boot cost, both times.
+
+**Rewording the spec** ("weak MySQL root credential" instead of "weak
+root password") fixed the retrieval collision - attempt 3 no longer
+produced SSH tasks contradicting SSH claims - but surfaced a different,
+more structural gap. The resulting role was a single, clean,
+self-consistent task using `community.mysql.mysql_user` (`login_password:
+password123`, `host: '%'`) - genuinely weak, genuinely what the role
+does. But `verify-vulnerabilities` only ever matches claims against
+`ansible.builtin.lineinfile` tasks' `line:` values (a deliberate scope
+decision made in week 6 - see its own section above), and this role has
+no `lineinfile` tasks at all: MySQL configuration naturally expresses as
+module *parameters* (`mysql_user`'s `host:`, `password:`), not
+config-file lines the way SSH/FTP/web-app specs consistently do. Every
+claim came back correctly `NOT VERIFIABLE`, and the run never booted -
+not because anything was wrong, but because nothing about this role's
+shape is checkable by the current mechanism, regardless of retry count.
+
+**Decision: recorded as a genuine, evidenced limitation for this
+evaluation round, not chased further.** Extending `verify-vulnerabilities`
+to check `mysql_user`-style claims live would need a real, separately-
+scoped mechanism (a live MySQL connection, with its own credential-chain
+complications - the very check would need to know the password its own
+target claim might have just changed), not a quick fix in the same
+spirit as the fast-fail checks above. The database vulnerability class
+is the one of the seven this evaluation round's specs cover where the
+full `build-scenario` chain (verify → storyline → plant → export) could
+not be demonstrated end-to-end - a real result, not a gap papered over,
+and consistent with this project's standard throughout: an honest,
+documented limitation over a forced pass.
+
+### A re-run of the very first scenario found a bug that had been silently possible the whole time
+
+Re-running the SSH-bastion spec (to get a clean, `--name`-tagged run for
+the dissertation) hit something that looked, at first glance, identical
+to the "never reached this check" boot-failure case - except the run
+had booted fine, and Ansible had genuinely applied every task
+(`changed`/`ok`, never `failed`). All four checks came back `[FALSE]`
+regardless. The actual command output (only visible in `report.json`,
+not the terminal summary) told the real story: every check failed with
+`vagrant.exe ssh` exiting **255** - SSH's own "the connection itself
+failed" code, never a remote command's exit status (`grep`'s own
+"nothing matched" is exit 1, forwarded verbatim by ssh; 255 means ssh
+never got a remote command to run at all).
+
+The cause, found by diffing this run's role against an earlier
+successful SSH-bastion run: the earlier one never actually restarted
+sshd after editing its config - four `lineinfile` tasks, no
+`ansible.builtin.service` task at all - so the `Port 2222` line sat in
+the file, unapplied, and the *file* checks (which is all `grep`-based
+verification ever does) passed by coincidence: nothing about the running
+service had actually changed. This run's role was more complete - it
+correctly restarted sshd after the edits - which means the port change
+*genuinely took effect*, and sshd stopped listening on port 22
+entirely. This tool's own SSH access assumes port 22 (Vagrant's default,
+never told otherwise) and has no mechanism to discover a changed one, so
+every subsequent check lost its only way to reach the guest. The more
+correct the generated role, the more certain this failure - not a fluke
+tied to one bad generation.
+
+**Fixed the reporting, not the underlying gap.** `CheckResult.matched`
+is now `bool | None`: `None` specifically for SSH's own exit 255 (the
+check never reached the guest), kept distinct from `False` (the check
+ran and found the content genuinely absent) - the same "don't conflate
+never-checked with checked-and-false" principle behind the `[N/A]`
+display fix from earlier this week, now applied one layer deeper, to
+the check-execution code itself rather than just the boot-failure case
+it was originally built for. `verify-vulnerabilities` now reports `COULD
+NOT VERIFY` with an explanation naming the likely cause, instead of a
+false `NOT TRUE`. What's **not** fixed: this tool still cannot actually
+verify anything on a VM whose SSH port changed and took effect - that
+would need Vagrant's own SSH access to be reconfigured dynamically
+mid-run (re-reading `ssh-config` after a port-changing task, or
+explicitly wiring a discovered port through to subsequent `v.ssh()`
+calls), a real, separately-scoped feature, not a quick fix. Recorded
+here as a known limitation: a live boot's honesty is only as good as
+this tool's own ability to keep observing it.
+
 ## Libraries and tools
 
 - **FastAPI** — the HTTP interface (`POST /generate`). Chosen over Flask
@@ -2258,3 +2602,16 @@ scenario uses (hosted runners support it natively); **WSL2** is what
   and provisioning run without hitting any Ansible-install failure. Not
   a guarantee against a *fourth* variant, but no longer just "grounded,
   not proven."
+- `verify-vulnerabilities`/`test-deploy` cannot check anything on a VM
+  once a role changes SSH's own listening port *and* restarts sshd -
+  confirmed live, an SSH-bastion re-run whose role correctly restarted
+  sshd after a `Port 2222` change broke this tool's own SSH access for
+  every subsequent check (Vagrant assumes port 22, with no mechanism to
+  discover a changed one). The reporting is fixed (a distinct `[N/A]`/
+  `COULD NOT VERIFY` instead of a false `NOT TRUE`), but the underlying
+  gap isn't - a role thorough enough to actually apply its own port
+  change is, ironically, the one this tool becomes unable to verify at
+  all. A real fix would need dynamic SSH reconfiguration mid-run
+  (re-reading `ssh-config`, or explicitly tracking a discovered port
+  through subsequent `v.ssh()` calls) - separately scoped future work,
+  not attempted here.

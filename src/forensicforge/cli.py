@@ -11,6 +11,7 @@ from .forensics import (
     provision_storyline,
     save_storyline,
     write_artefact_role,
+    write_scenario_markdown,
 )
 from .forensics.scenarios import ALL_SCENARIOS
 from .imaging import export_scenario_image
@@ -54,14 +55,19 @@ def generate(spec: str, no_rag: bool) -> None:
 
 @main.command()
 @click.argument("spec")
-def provision(spec: str) -> None:
+@click.option(
+    "--name", "name", default=None,
+    help="Appended to the run directory's name (e.g. \"ssh bastion\" -> \"20260901-123432-ssh bastion\") "
+    "so a batch of runs stays identifiable by eye. Purely a folder-naming convenience.",
+)
+def provision(spec: str, name: str | None) -> None:
     """Generate a VM spec and write an Ansible role + Vagrantfile + Molecule scenario.
 
     Does NOT boot anything - run `validate` for static scans and Molecule
     verification, then `test-deploy` to boot/verify/destroy a real VM.
     """
     try:
-        result = provision_spec(spec)
+        result = provision_spec(spec, name=name)
     except AnsibleParseError as exc:
         click.echo(f"Failed to parse LLM output into a valid Ansible role: {exc}", err=True)
         click.echo("\n--- Raw LLM output ---\n", err=True)
@@ -69,6 +75,9 @@ def provision(spec: str) -> None:
         raise SystemExit(1)
 
     click.echo(f"Wrote run '{result.run_id}' to: {result.run_dir}")
+    click.echo(f"  Retrieved {len(result.snippets)} corpus snippet(s):" if result.snippets else "  Retrieved 0 corpus snippets - nothing in the corpus matched this spec.")
+    for snippet in result.snippets:
+        click.echo(f"    - {snippet.source}")
     if result.repairs:
         click.echo(f"  Auto-repaired {len(result.repairs)} known issue(s) in the generated output:")
         for note in result.repairs:
@@ -213,7 +222,7 @@ def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None, stor
         click.echo(f"  artefacts_verified: {result.artefacts_verified}")
     click.echo(f"  destroyed:         {result.destroyed}")
     for check in result.checks:
-        mark = "PASS" if check.matched else "FAIL"
+        mark = "N/A " if check.matched is None else ("PASS" if check.matched else "FAIL")
         attribution = {
             "changed": "applied by this run",
             "ok": "already true before this run - NOT attributable",
@@ -350,10 +359,12 @@ def forensic_scenario_from_run_cmd(run_dir: Path, role_name: str) -> None:
         report = {"run_id": run_dir.name, "scans": None, "molecule": None, "test_deploy": None}
     report["vulnerabilities"] = vuln_report.to_dict()
     write_report(report, run_dir)
+    scenario_path = write_scenario_markdown(storyline, vuln_report, run_dir)
 
     click.echo(f"\n{storyline.title}\n  {storyline.narrative}\n")
     click.echo(f"Wrote artefact role:     {artefact_role_dir}")
     click.echo(f"Wrote storyline manifest: {storyline_path}")
+    click.echo(f"Wrote scenario summary:  {scenario_path}")
     click.echo("\nNext:")
     click.echo(f"  forensicforge test-deploy {run_dir} --storyline-file {storyline_path}")
 
@@ -361,7 +372,12 @@ def forensic_scenario_from_run_cmd(run_dir: Path, role_name: str) -> None:
 @main.command(name="build-scenario")
 @click.argument("spec")
 @click.option("--role-name", default="training_vm", help="Role name within the run's roles/.")
-def build_scenario_cmd(spec: str, role_name: str) -> None:
+@click.option(
+    "--name", "name", default=None,
+    help="Appended to the run directory's name (e.g. \"ssh bastion\" -> \"20260901-123432-ssh bastion\") "
+    "so a batch of runs stays identifiable by eye. Purely a folder-naming convenience.",
+)
+def build_scenario_cmd(spec: str, role_name: str, name: str | None) -> None:
     """One prompt in, one forensic scenario out: generate a VM, verify its
     claimed vulnerabilities live, build a storyline consistent with what
     actually verified, plant it, and export a portable VM image.
@@ -372,13 +388,13 @@ def build_scenario_cmd(spec: str, role_name: str) -> None:
     vulnerabilities, a final one to verify everything and export the
     image) - each is destroyed afterward, same as every other command
     here. Requires an elevated terminal (Hyper-V) and WSL with qemu-utils
-    installed (see scripts/check_wsl_tools.py) for the image-export step.
-    The image-export mechanism is new and, as of this version, has not
-    yet been proven against a real boot - see docs/METHODOLOGY.md (week 6).
+    installed (see scripts/check_wsl_tools.py) for the image-export step -
+    see docs/METHODOLOGY.md (week 6) for the live run that confirmed the
+    whole chain, image export included, actually works.
     """
     click.echo(f"Generating a VM for: {spec!r} ...")
     try:
-        provision_result = provision_spec(spec, role_name=role_name)
+        provision_result = provision_spec(spec, role_name=role_name, name=name)
     except AnsibleParseError as exc:
         click.echo(f"Failed to parse LLM output into a valid Ansible role: {exc}", err=True)
         click.echo("\n--- Raw LLM output ---\n", err=True)
@@ -387,6 +403,9 @@ def build_scenario_cmd(spec: str, role_name: str) -> None:
 
     run_dir = provision_result.run_dir
     role_dir = provision_result.role_dir
+    click.echo(f"  Retrieved {len(provision_result.snippets)} corpus snippet(s):" if provision_result.snippets else "  Retrieved 0 corpus snippets - nothing in the corpus matched this spec.")
+    for snippet in provision_result.snippets:
+        click.echo(f"    - {snippet.source}")
     if provision_result.repairs:
         click.echo(f"  Auto-repaired {len(provision_result.repairs)} known issue(s) in the generated output:")
         for note in provision_result.repairs:
@@ -407,6 +426,19 @@ def build_scenario_cmd(spec: str, role_name: str) -> None:
     if vuln_report.error:
         click.echo(f"  error: {vuln_report.error}", err=True)
 
+    # Written now, not only at the very end: if storyline-building fails
+    # below (no qualifying entry vector) the command exits before reaching
+    # the final report.json write it used to rely on - which meant a
+    # genuinely informative outcome (every claim checked, none qualified)
+    # left no durable record at all, only whatever scrolled past in the
+    # terminal. Confirmed as a real gap while planning a batch of
+    # multi-spec evaluation runs, where an unattended, honestly-failed run
+    # needs its own data recoverable afterward just as much as a
+    # successful one does. See docs/METHODOLOGY.md.
+    report = {"run_id": provision_result.run_id, "scans": None, "molecule": None, "test_deploy": None}
+    report["vulnerabilities"] = vuln_report.to_dict()
+    write_report(report, run_dir)
+
     click.echo("\nBuilding a forensic storyline from what actually verified ...")
     try:
         storyline = build_storyline_from_vulnerabilities(vuln_report, spec=spec, run_id=provision_result.run_id)
@@ -421,15 +453,20 @@ def build_scenario_cmd(spec: str, role_name: str) -> None:
     write_artefact_role(storyline, run_dir, scenario_role_name=role_name)
     storyline_path = run_dir / "storyline.json"
     save_storyline(storyline, storyline_path)
+    scenario_path = write_scenario_markdown(storyline, vuln_report, run_dir)
     click.echo(f"\n{storyline.title}\n  {storyline.narrative}\n")
 
     click.echo("Final boot: verifying config + planted evidence, then exporting a portable image ...")
     checks = derive_checks_from_role(role_dir) + derive_checks_from_storyline(storyline)
-    # Matches vagrantfile_writer.VAGRANTFILE_TEMPLATE's `h.vmname` setting
-    # for this run, which is set to the same hostname provision_spec()
-    # already generates - the deterministic name export_scenario_image()
-    # needs to find this specific Hyper-V VM by name.
-    vm_name = f"forensicforge-{provision_result.run_id}"
+    # provision_result.vm_hostname, not a string rebuilt from run_id: the
+    # run directory's name can carry a human-readable --name suffix
+    # (spaces and all), but the guest hostname / Hyper-V VM name
+    # (config.vm.hostname / h.vmname in the generated Vagrantfile) can't
+    # contain spaces - vm_hostname is the one string guaranteed to match
+    # what's actually in the Vagrantfile, which is what
+    # export_scenario_image() needs to find this VM by name. See
+    # docs/METHODOLOGY.md.
+    vm_name = provision_result.vm_hostname
     image_holder: dict[str, Path] = {}
 
     def _export_hook() -> None:
@@ -450,6 +487,7 @@ def build_scenario_cmd(spec: str, role_name: str) -> None:
 
     click.echo("\n=== Scenario ready ===")
     click.echo(f"{storyline.title}\n{storyline.narrative}\n")
+    click.echo(f"Scenario summary: {scenario_path}")
     image_path = image_holder.get("path")
     if image_path is not None:
         click.echo(f"Portable VM image: {image_path}")

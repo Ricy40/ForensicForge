@@ -2,7 +2,9 @@ import yaml
 
 from forensicforge.provision.ansible_writer import write_ansible_role
 from forensicforge.provision.repair import (
+    repair_dangling_notify,
     repair_lineinfile_backreferences,
+    repair_trailing_handlers_block,
     repair_user_module_path_misuse,
     repair_yaml_text,
 )
@@ -184,3 +186,132 @@ def test_repair_user_module_path_misuse_leaves_normal_user_tasks_untouched():
 
     assert notes == []
     assert repaired == tasks
+
+
+# --- repair_dangling_notify: the "handler not found" bug ---
+
+NOTIFY_TASKS_YAML = """\
+- name: Enable verbose error pages in Apache configuration
+  ansible.builtin.lineinfile:
+    path: /etc/apache2/sites-available/000-default.conf
+    regexp: ^#.*ErrorLog .*
+    line: ErrorLog ${APACHE_LOG_DIR}/error.log
+  notify: restart apache
+- name: Restart Apache to apply changes
+  ansible.builtin.service:
+    name: apache2
+    state: restarted
+"""
+
+
+def test_repair_dangling_notify_strips_notify_key():
+    """Regression test for a real live failure: `notify: restart apache`
+    with no handlers/main.yml (this pipeline never writes one) crashed
+    the whole play with "The requested handler 'restart apache' was not
+    found" - confirmed against a real web-app-misconfig run, ~10 minutes
+    into a live boot."""
+    tasks = yaml.safe_load(NOTIFY_TASKS_YAML)
+
+    repaired, notes = repair_dangling_notify(tasks)
+
+    assert len(notes) == 1
+    assert "notify" not in repaired[0]
+    # The task's actual content (the claimed misconfiguration) is
+    # untouched - only the broken notify: key is removed.
+    assert repaired[0]["ansible.builtin.lineinfile"]["line"] == "ErrorLog ${APACHE_LOG_DIR}/error.log"
+    assert repaired[1] == tasks[1]
+
+
+def test_repair_dangling_notify_leaves_tasks_without_notify_untouched():
+    tasks = yaml.safe_load("- name: x\n  ansible.builtin.package:\n    name: apache2\n    state: present\n")
+
+    repaired, notes = repair_dangling_notify(tasks)
+
+    assert notes == []
+    assert repaired == tasks
+
+
+def test_write_ansible_role_recovers_from_real_dangling_notify_bug(tmp_path):
+    raw_output = f"```yaml\n{NOTIFY_TASKS_YAML}```\n\n**Applied misconfigurations:**\n1. Verbose error pages enabled.\n"
+
+    role_dir, repairs = write_ansible_role(raw_output, tmp_path / "run")
+
+    assert len(repairs) == 1
+    assert "notify" in repairs[0]
+    tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
+    assert all("notify" not in t for t in tasks)
+
+
+# --- repair_trailing_handlers_block: a top-level handlers: after the task list ---
+
+TRAILING_HANDLERS_YAML = """\
+- name: Install Apache on the Ubuntu system
+  ansible.builtin.package:
+    name: apache2
+    state: present
+
+- name: Set verbose error pages on Apache server
+  ansible.builtin.lineinfile:
+    path: /etc/apache2/sites-available/000-default.conf
+    regexp: '^#ErrorLog ${APACHE_LOG_DIR}/error.log'
+    line: 'ErrorLog ${APACHE_LOG_DIR}/error.log'
+  notify: restart_apache
+
+handlers:
+  - name: restart_apache
+    ansible.builtin.service:
+      name: apache2
+      state: restarted
+"""
+
+
+def test_repair_trailing_handlers_block_strips_it_and_reparses():
+    try:
+        yaml.safe_load(TRAILING_HANDLERS_YAML)
+        assert False, "fixture should reproduce the real parse failure"
+    except yaml.YAMLError as exc:
+        repaired_text, note = repair_trailing_handlers_block(TRAILING_HANDLERS_YAML, exc)
+
+    assert repaired_text is not None
+    tasks = yaml.safe_load(repaired_text)
+    assert len(tasks) == 2
+    assert "handlers" not in repaired_text
+
+
+def test_write_ansible_role_recovers_from_real_multi_bug_generation(tmp_path):
+    """Regression test for a real live failure: one generation triggered
+    *two* distinct bugs at once (a nested-quote issue and a trailing
+    handlers: block) - the first version of parse_tasks() only tried one
+    repair-and-retry cycle, so fixing the first issue still left the
+    second to fail the retry and abort the whole generation. Uses the
+    exact combination seen live: a nested-single-quote line plus a
+    trailing top-level handlers: block, in the same document."""
+    raw_output = (
+        "```yaml\n"
+        "- name: Create an admin panel with default credentials\n"
+        "  ansible.builtin.lineinfile:\n"
+        "    path: /var/www/html/admin/index.php\n"
+        "    regexp: '^$'\n"
+        "    line: '$username = 'admin'; $password = 'admin123';'\n"
+        "\n"
+        "- name: Set verbose error pages on Apache server\n"
+        "  ansible.builtin.lineinfile:\n"
+        "    path: /etc/apache2/sites-available/000-default.conf\n"
+        "    regexp: '^#ErrorLog'\n"
+        "    line: 'ErrorLog ${APACHE_LOG_DIR}/error.log'\n"
+        "  notify: restart_apache\n"
+        "\n"
+        "handlers:\n"
+        "  - name: restart_apache\n"
+        "    ansible.builtin.service:\n"
+        "      name: apache2\n"
+        "      state: restarted\n"
+        "```\n\n**Applied misconfigurations:**\n1. Default admin credentials.\n"
+    )
+
+    role_dir, repairs = write_ansible_role(raw_output, tmp_path / "run")
+
+    assert len(repairs) >= 2
+    tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
+    assert len(tasks) == 2
+    assert all("notify" not in t for t in tasks)

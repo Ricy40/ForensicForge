@@ -41,7 +41,45 @@ _ENTRY_VECTORS: list[tuple[re.Pattern, str, str]] = [
      "the database service, left reachable over the network with no authentication required"),
     (re.compile(r"\bufw\b|firewall|iptables", re.IGNORECASE), "firewall",
      "an overly permissive firewall rule"),
+    (re.compile(r"vsftpd|anonymous_enable|\bftp\b", re.IGNORECASE), "vsftpd",
+     "the FTP service, left open to anonymous access"),
+    (re.compile(r"apache|nginx|httpd|directory.?listing|admin.?panel|\bhttp\b", re.IGNORECASE), "apache2",
+     "the web server, left with an exploitable misconfiguration"),
+    (re.compile(r"sudoers|\bsuid\b|setuid|privilege.?escalation", re.IGNORECASE), "sudo",
+     "a privilege-escalation path left open in the system's own permission configuration"),
+    (re.compile(r"openssl|unattended.?upgrades|apt.?daily|outdated|unpatched", re.IGNORECASE), "apt",
+     "an outdated, unpatched package left unaddressed by automatic updates"),
+    (re.compile(r"auditd|rsyslog|\bsyslog\b|audit.?log|logging", re.IGNORECASE), "auditd",
+     "the system's own audit logging, left disabled or misdirected"),
 ]
+
+# The fallback for a claim that matches none of the categories above.
+# Deliberately does NOT embed the claim's own text (finding.claim can be a
+# full explanatory sentence, not a short phrase) - confirmed as a real bug
+# against a live vsftpd run, whose claim had no category match: the
+# narrative repeated the entire claim sentence twice, once from this
+# description and again from `specific` in the narrative below, reading
+# as a garbled, doubled mess. `specific` alone already carries the exact
+# verified text; this description only needs to name the *category* as
+# unclassified, not restate the claim.
+_GENERIC_ENTRY_DESCRIPTION = "a misconfiguration this run's own generation claimed to apply"
+
+# service label -> what the fictional business plausibly uses this machine
+# for, tying generators.fictional_business_context()'s backstory to the
+# actual entry vector rather than a generic "runs a server" sentence -
+# see _business_backstory() below.
+_BUSINESS_FUNCTIONS: dict[str, str] = {
+    "sshd": "let staff remotely access the office server",
+    "vsftpd": "share files with clients and suppliers over FTP",
+    "apache2": "host their public-facing website",
+    "database": "store customer and order records in a database",
+    "telnetd": "manage an older piece of shop equipment over the network",
+    "firewall": "run their day-to-day office server",
+    "sudo": "run their day-to-day office server",
+    "apt": "run their day-to-day office server",
+    "auditd": "run their day-to-day office server",
+    "session": "run their day-to-day office server",
+}
 
 
 def _classify_entry_vector(finding: VulnerabilityFinding) -> tuple[str, str]:
@@ -49,7 +87,22 @@ def _classify_entry_vector(finding: VulnerabilityFinding) -> tuple[str, str]:
     for pattern, service, description in _ENTRY_VECTORS:
         if pattern.search(haystack):
             return service, description
-    return "session", f"the misconfiguration this run's own generation claimed to apply ({finding.claim})"
+    return "session", _GENERIC_ENTRY_DESCRIPTION
+
+
+def _business_backstory(service: str) -> str:
+    """A short scene-setting sentence naming a fictional small business and
+    why it runs this particular machine - gives the narrative a concrete
+    "who" instead of describing a bare VM. See
+    generators.fictional_business_context()'s own docstring: fully
+    fabricated, same synthetic-only standard as every other generator this
+    module uses."""
+    context = gen.fictional_business_context()
+    function = _BUSINESS_FUNCTIONS.get(service, _BUSINESS_FUNCTIONS["session"])
+    return (
+        f"{context.name}, a small {context.business_type}, uses this machine to {function}. "
+        f"{context.admin_name} looks after IT part-time, alongside their regular role."
+    )
 
 
 def _entry_artefact(service: str, description: str, when: datetime, user: str) -> Artefact:
@@ -112,6 +165,7 @@ def build_storyline_from_vulnerabilities(
     intrusion_time = datetime(2026, 8, 15, 2, 30, 0)
 
     narrative = (
+        f"{_business_backstory(service)} "
         f"A training VM provisioned for '{spec}' was found accessed outside normal hours. "
         f"This run's own generated role deliberately applied {description} - specifically, "
         f"{specific!r} (task: {entry.task_name!r}) - verified live against the booted VM and "

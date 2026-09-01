@@ -245,6 +245,73 @@ def test_test_deploy_attribution_lookup_matches_role_prefixed_task_name(tmp_path
     assert result.checks[0].attribution == "changed"
 
 
+def test_test_deploy_distinguishes_ssh_connection_failure_from_content_not_found(tmp_path, monkeypatch):
+    """Regression test for a real live bug: a role that changed sshd's
+    Port *and* restarted the service (more complete than earlier roles
+    that only edited the file without restarting) broke this tool's own
+    SSH access - it assumes port 22, with no way to discover the new one.
+    Every check then failed with SSH's own exit 255 ("connection itself
+    failed"), which used to be treated identically to grep's exit 1 ("ran,
+    found nothing") - reporting a config change as confirmed-absent when
+    really the check never reached the guest at all. matched must be None
+    (distinct from False) for the 255 case."""
+    td = sys.modules["forensicforge.validate.test_deploy"]
+
+    role_dir = _write_role_tasks(tmp_path, LINEINFILE_TASKS)
+    checks = td.derive_checks_from_role(role_dir)
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            with out_cm() as fh:
+                fh.write(CHANGED_TASK_LOG)
+
+        def up(self, provider=None, provision=None):
+            pass
+
+        def ssh(self, command):
+            raise subprocess.CalledProcessError(255, ["vagrant", "ssh"], output=b"ssh: connect to host port 22: Connection refused")
+
+        def destroy(self):
+            pass
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    result = td.test_deploy(tmp_path, checks)
+
+    assert result.checks[0].matched is None
+    assert result.config_verified is False  # still an aggregate failure - just distinguishable per-check
+
+
+def test_test_deploy_treats_grep_not_found_as_false_not_none(tmp_path, monkeypatch):
+    """The contrasting case: a real remote command failure (grep's own
+    exit 1, "no match") is a legitimate False, not an SSH connection
+    problem - must not be conflated with the 255 case above."""
+    td = sys.modules["forensicforge.validate.test_deploy"]
+
+    role_dir = _write_role_tasks(tmp_path, LINEINFILE_TASKS)
+    checks = td.derive_checks_from_role(role_dir)
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            with out_cm() as fh:
+                fh.write(CHANGED_TASK_LOG)
+
+        def up(self, provider=None, provision=None):
+            pass
+
+        def ssh(self, command):
+            raise subprocess.CalledProcessError(1, ["vagrant", "ssh"], output=b"")
+
+        def destroy(self):
+            pass
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    result = td.test_deploy(tmp_path, checks)
+
+    assert result.checks[0].matched is False
+
+
 def test_test_deploy_runs_post_verify_hook_before_destroy(tmp_path, monkeypatch):
     """build-scenario (week 6) needs to export the VM's disk while it
     still exists, after checks but before destroy() runs."""

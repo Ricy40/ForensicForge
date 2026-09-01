@@ -209,15 +209,23 @@ def verify_vulnerabilities(run_dir: Path, role_dir: Path) -> VulnerabilityReport
         finding.actual = check_result.matched
         finding.attribution = check_result.attribution
         finding.output = check_result.output
-        if not check_result.matched:
-            finding.note = "NOT TRUE on the live VM - the claimed misconfiguration was not actually applied"
+        if check_result.matched is None:
+            finding.note = (
+                "COULD NOT VERIFY - the check itself could not connect over SSH "
+                "(connection failed), even though the VM booted and Ansible ran. A task "
+                "that changes SSH's own listening port and then restarts sshd is a "
+                "likely cause (this tool's SSH access assumes port 22 and has no way to "
+                "discover a new one) - the claimed change may or may not be "
+                "true, this run just couldn't reach the guest to check"
+            )
+        elif not check_result.matched:
+            finding.note = "NOT TRUE on the live VM - the claimed misconfiguration was not applied"
         elif check_result.attribution == "changed":
-            finding.note = "TRUE on the live VM, and Ansible's own output confirms this run's role caused it"
+            finding.note = "TRUE on the live VM, and Ansible's output confirms this run's role caused it"
         elif check_result.attribution == "ok":
             finding.note = (
                 "TRUE on the live VM, but the task reported 'ok' not 'changed' - it was "
                 "already true before this run applied anything, NOT attributable to this role "
-                "(the exact week 3 PermitRootLogin gap this command exists to catch)"
             )
         elif check_result.attribution in ("skipping", "failed", "fatal"):
             finding.note = f"TRUE on the live VM, but the claiming task itself reported '{check_result.attribution}'"

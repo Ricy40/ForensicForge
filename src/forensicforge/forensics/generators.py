@@ -8,11 +8,42 @@ record: if a demo scenario needs to "feel real," make it more elaborate
 with Faker, never substitute anything genuine.
 """
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from faker import Faker
 
 fake = Faker()
+
+# Small-business flavors for fictional_business_context() - deliberately
+# ordinary, low-stakes organizations (not banks, hospitals, or anything
+# whose fictional compromise could read as making light of a genuinely
+# high-consequence breach) - a storyline's backstory should feel concrete,
+# not dramatic. All fabricated, same as every other generator here.
+_SMALL_BUSINESS_TYPES = [
+    "catering company", "bakery", "plumbing business", "auto repair shop",
+    "veterinary clinic", "print shop", "landscaping company", "accounting firm",
+    "furniture restorer", "bicycle repair shop",
+]
+
+
+@dataclass
+class BusinessContext:
+    name: str
+    business_type: str
+    admin_name: str
+
+
+def fictional_business_context() -> BusinessContext:
+    """A small, fabricated organization to ground a storyline's backstory in
+    - who actually runs this machine, and why, rather than a narrative
+    describing a VM in the abstract. See module docstring: fully synthetic,
+    same as every other generator here."""
+    return BusinessContext(
+        name=fake.company(),
+        business_type=fake.random_element(_SMALL_BUSINESS_TYPES),
+        admin_name=fake.name(),
+    )
 
 
 def shell_command_exfiltration(filename: str | None = None, host: str | None = None) -> str:

@@ -10,6 +10,8 @@ from forensicforge.validate.vulnerabilities import (
     parse_applied_misconfigurations,
     verify_vulnerabilities,
 )
+from forensicforge.forensics.generators import fictional_business_context
+from forensicforge.forensics.scenario_doc import render_scenario_markdown
 from forensicforge.forensics.storyline_builder import build_storyline_from_vulnerabilities
 
 LINEINFILE_TASKS = """\
@@ -172,6 +174,44 @@ def test_claim_false_on_live_vm(tmp_path, monkeypatch):
     assert "NOT TRUE" in finding.note
 
 
+def test_claim_reported_as_could_not_verify_on_ssh_connection_failure(tmp_path, monkeypatch):
+    """Regression test for a real live bug: a role that changed sshd's
+    Port and restarted the service broke this tool's own SSH access
+    (assumes port 22, no way to discover the new one) - every check then
+    failed with SSH's own exit 255. Must be reported distinctly from
+    "NOT TRUE" (which asserts the claim is false) - the check never
+    actually reached the guest, so nothing was confirmed either way."""
+    import subprocess
+
+    role_dir = _write_role_tasks(tmp_path, LINEINFILE_TASKS)
+    (tmp_path / "generation.md").write_text(RAW_OUTPUT_WITH_BACKTICK_CLAIM, encoding="utf-8")
+
+    td = sys.modules["forensicforge.validate.test_deploy"]
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            with out_cm() as fh:
+                fh.write(CHANGED_TASK_LOG)
+
+        def up(self, provider=None, provision=None):
+            pass
+
+        def ssh(self, command):
+            raise subprocess.CalledProcessError(255, ["vagrant", "ssh"], output=b"Connection refused")
+
+        def destroy(self):
+            pass
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    result = verify_vulnerabilities(tmp_path, role_dir)
+
+    finding = result.findings[0]
+    assert finding.actual is None
+    assert "COULD NOT VERIFY" in finding.note
+    assert "NOT TRUE" not in finding.note
+
+
 def test_matches_a_claim_whose_directive_is_bold_not_backticked(tmp_path):
     """Regression test for a real failure: a live run wrapped the actual
     directive in **bold** and used its only backtick span for an
@@ -279,3 +319,91 @@ def test_build_storyline_classifies_non_ssh_entry_vector():
 
     assert "Telnet" in storyline.title
     assert "telnetd" in storyline.artefacts[0].content
+
+
+def test_build_storyline_classifies_ftp_entry_vector():
+    report = VulnerabilityReport(booted=True, destroyed=True, findings=[
+        _finding(claim="`anonymous_enable=YES` allows anonymous FTP uploads", directive="anonymous_enable=YES",
+                  task_name="Configure vsftpd to allow anonymous uploads"),
+    ])
+
+    storyline = build_storyline_from_vulnerabilities(report, spec="Ubuntu FTP server", run_id="20260101-000000")
+
+    assert "FTP" in storyline.title
+    assert "vsftpd" in storyline.artefacts[0].content
+
+
+def test_build_storyline_unclassified_claim_does_not_duplicate_the_claim_text():
+    """Regression test for a real bug: a live vsftpd run's claim didn't
+    match any category (before vsftpd was added to _ENTRY_VECTORS above),
+    so the generic fallback kicked in - and its description used to embed
+    finding.claim verbatim, which is a full sentence, not a short phrase.
+    The narrative ended up repeating that entire sentence twice: once from
+    the (long) description, once from `specific`. The fallback must never
+    embed the claim text - only `specific` should."""
+    long_claim = (
+        "`some_directive=value` from the config - This is a real vulnerability because "
+        "it does something bad in great detail across a full explanatory sentence."
+    )
+    report = VulnerabilityReport(booted=True, destroyed=True, findings=[
+        _finding(claim=long_claim, directive="some_directive=value", task_name="Do the thing"),
+    ])
+
+    storyline = build_storyline_from_vulnerabilities(report, spec="Ubuntu server", run_id="20260101-000000")
+
+    assert storyline.narrative.count("real vulnerability because it does something bad") == 0
+    assert storyline.narrative.count("some_directive=value") == 1
+
+
+def test_build_storyline_narrative_has_a_business_backstory():
+    report = VulnerabilityReport(booted=True, destroyed=True, findings=[
+        _finding(claim="`anonymous_enable=YES` allows anonymous FTP uploads", directive="anonymous_enable=YES",
+                  task_name="Configure vsftpd to allow anonymous uploads"),
+    ])
+
+    storyline = build_storyline_from_vulnerabilities(report, spec="Ubuntu FTP server", run_id="20260101-000000")
+
+    assert "uses this machine to" in storyline.narrative
+    assert "FTP" in storyline.narrative or "files" in storyline.narrative
+
+
+# --- generators.fictional_business_context() ---
+
+def test_fictional_business_context_has_all_fields():
+    context = fictional_business_context()
+
+    assert context.name
+    assert context.business_type
+    assert context.admin_name
+
+
+# --- scenario_doc.render_scenario_markdown() ---
+
+def test_render_scenario_markdown_includes_title_narrative_and_vulnerability_table():
+    from forensicforge.forensics.storyline import Storyline
+
+    storyline = Storyline(id="t", title="Intrusion via X", narrative="Something happened.", base_spec="x", artefacts=[])
+    report = VulnerabilityReport(booted=True, destroyed=True, findings=[
+        _finding(claim="X was true", actual=True, attribution="changed", note="TRUE and attributed"),
+        _finding(claim="Y unclear", verifiable=False, actual=None, attribution=None, note="NOT VERIFIABLE - no match"),
+    ])
+
+    markdown = render_scenario_markdown(storyline, report)
+
+    assert markdown.startswith("# Intrusion via X")
+    assert "Something happened." in markdown
+    assert "## Vulnerabilities" in markdown
+    assert "X was true" in markdown
+    assert "Confirmed true" in markdown
+    assert "Not verifiable" in markdown
+
+
+def test_render_scenario_markdown_handles_no_findings():
+    from forensicforge.forensics.storyline import Storyline
+
+    storyline = Storyline(id="t", title="T", narrative="N", base_spec="x", artefacts=[])
+    report = VulnerabilityReport(booted=False, destroyed=False, findings=[])
+
+    markdown = render_scenario_markdown(storyline, report)
+
+    assert "No claimed vulnerabilities were recorded" in markdown

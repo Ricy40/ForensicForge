@@ -70,3 +70,4 @@ REPORT_FILENAME = "report.json"
 # generated/ won't have them - see docs/METHODOLOGY.md (week 6).
 SPEC_FILENAME = "spec.txt"
 GENERATION_FILENAME = "generation.md"
+RETRIEVAL_FILENAME = "retrieval.json"

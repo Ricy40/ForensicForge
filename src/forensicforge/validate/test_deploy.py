@@ -30,7 +30,13 @@ class CheckResult:
     command: str
     expected: str
     output: str
-    matched: bool
+    # None specifically means the SSH connection itself failed (ssh's own
+    # exit 255 - distinct from the remote command's exit code, which ssh
+    # forwards verbatim) - the check never actually ran against the guest,
+    # as opposed to running and finding the content absent (False). See
+    # the check-execution loop below for why this distinction is real,
+    # not cosmetic - confirmed live, not hypothetical.
+    matched: bool | None
     task_name: str | None = None
     # "changed" = this run's role application caused the config; "ok" =
     # the task ran but the file already matched (NOT attributable to this
@@ -218,7 +224,21 @@ def test_deploy(
                 matched = check.expected in output
             except subprocess.CalledProcessError as exc:
                 output = _proc_error_text(exc)
-                matched = False
+                # exit 255 is SSH's own "the connection itself failed"
+                # code (refused/unreachable/timed out) - never the remote
+                # command's exit status, which ssh forwards verbatim
+                # (grep's own "no match" is 1). Conflating the two used to
+                # report a config change as confirmed-absent when really
+                # the check never ran at all - confirmed live: a role
+                # that changes sshd's Port *and* restarts the service
+                # (more complete than earlier roles that only edited the
+                # file) broke this tool's own SSH access, which assumes
+                # port 22 and has no way to discover the new one. Every
+                # check after that failed with exit 255 and got reported
+                # as "not applied," which was false - the file likely did
+                # have the line; this tool just couldn't reach the guest
+                # to look anymore. See docs/METHODOLOGY.md.
+                matched = None if exc.returncode == 255 else False
             result.checks.append(
                 CheckResult(
                     command=check.command,

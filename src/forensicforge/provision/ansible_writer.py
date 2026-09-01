@@ -5,12 +5,21 @@ from pathlib import Path
 import yaml
 
 from .repair import (
+    repair_dangling_notify,
     repair_lineinfile_backreferences,
+    repair_trailing_handlers_block,
     repair_user_module_path_misuse,
     repair_yaml_text,
 )
 
 YAML_BLOCK_PATTERN = re.compile(r"```ya?ml\s*\n(.*?)```", re.DOTALL)
+
+# Tried in order against each YAML parse failure - see parse_tasks(). More
+# than one can be needed for a single generation (confirmed live: a
+# nested-quote issue and a trailing handlers: block in the same output),
+# so parse_tasks() loops through this list repeatedly, not just once.
+_YAML_TEXT_REPAIRS = (repair_yaml_text, repair_trailing_handlers_block)
+_MAX_YAML_REPAIR_ATTEMPTS = 4
 
 # Must match the `author:` field below - ansible-compat's local role
 # installer (which Molecule calls during "prerun") namespaces the role
@@ -83,23 +92,41 @@ def parse_tasks(yaml_text: str, raw_output: str) -> tuple[list[dict], list[str]]
     fixes where they apply. Returns (tasks, repair_notes) - notes is empty
     when nothing needed fixing. Still raises AnsibleParseError, unchanged,
     for anything the repairs don't recognize.
+
+    Loops through _YAML_TEXT_REPAIRS repeatedly (bounded by
+    _MAX_YAML_REPAIR_ATTEMPTS), not just once: a single generation can
+    trigger more than one distinct bug (confirmed live - a nested-quote
+    issue and a trailing handlers: block in the same output), and fixing
+    only the first one PyYAML happens to report would still leave the
+    second to fail the retry and abort the whole generation.
     """
     repair_notes: list[str] = []
-    try:
-        tasks = yaml.safe_load(yaml_text)
-    except yaml.YAMLError as exc:
-        repaired_text, note = repair_yaml_text(yaml_text, exc)
-        if repaired_text is None:
-            raise AnsibleParseError(f"Extracted YAML failed to parse: {exc}", raw_output) from exc
+    tasks = None
+    for _ in range(_MAX_YAML_REPAIR_ATTEMPTS):
         try:
-            tasks = yaml.safe_load(repaired_text)
-        except yaml.YAMLError as retry_exc:
-            raise AnsibleParseError(
-                f"Extracted YAML failed to parse, and an automatic repair attempt "
-                f"({note}) still didn't produce valid YAML: {retry_exc}", raw_output,
-            ) from retry_exc
-        yaml_text = repaired_text
-        repair_notes.append(note)
+            tasks = yaml.safe_load(yaml_text)
+            break
+        except yaml.YAMLError as exc:
+            repaired_text = note = None
+            for repair_fn in _YAML_TEXT_REPAIRS:
+                repaired_text, note = repair_fn(yaml_text, exc)
+                if repaired_text is not None:
+                    break
+            if repaired_text is None:
+                if repair_notes:
+                    raise AnsibleParseError(
+                        f"Extracted YAML failed to parse, and automatic repair attempts "
+                        f"({'; '.join(repair_notes)}) still didn't produce valid YAML: {exc}",
+                        raw_output,
+                    ) from exc
+                raise AnsibleParseError(f"Extracted YAML failed to parse: {exc}", raw_output) from exc
+            yaml_text = repaired_text
+            repair_notes.append(note)
+    else:
+        raise AnsibleParseError(
+            f"Extracted YAML still didn't parse after {_MAX_YAML_REPAIR_ATTEMPTS} "
+            f"automatic repair attempts ({'; '.join(repair_notes)}).", raw_output,
+        )
 
     if not isinstance(tasks, list) or not tasks:
         raise AnsibleParseError("Extracted YAML is not a non-empty list of tasks.", raw_output)
@@ -114,8 +141,123 @@ def parse_tasks(yaml_text: str, raw_output: str) -> tuple[list[dict], list[str]]
     repair_notes.extend(backref_notes)
     tasks, user_path_notes = repair_user_module_path_misuse(tasks)
     repair_notes.extend(user_path_notes)
+    tasks, notify_notes = repair_dangling_notify(tasks)
+    repair_notes.extend(notify_notes)
+    _reject_external_file_references(tasks, raw_output)
+    _reject_interactive_commands(tasks, raw_output)
+    _reject_nonexistent_modules(tasks, raw_output)
 
     return tasks, repair_notes
+
+
+# ansible.builtin.template always reads a .j2 file from the Ansible
+# controller (this project's own machine) - but write_ansible_role() only
+# ever writes tasks/main.yml, never a templates/ directory, so any task
+# using it is broken by construction: it references a file that can never
+# exist. Confirmed as a real live failure (not hypothetical) - a
+# web-app-misconfig spec generated a `template` task, and the boot got
+# ~10 minutes in (through package installs and several other tasks)
+# before failing on it. The RAG prompt no longer suggests `template` as
+# an example module (see prompts.py), but an LLM doesn't always follow
+# instructions - this check catches it in under a second at generation
+# time, before any VM boot, rather than 10+ wasted minutes into a live
+# one. See docs/METHODOLOGY.md (week 6).
+_EXTERNAL_FILE_MODULES = ("ansible.builtin.template",)
+
+
+def _reject_external_file_references(tasks: list[dict], raw_output: str) -> None:
+    for task in tasks:
+        for module in _EXTERNAL_FILE_MODULES:
+            if module in task:
+                raise AnsibleParseError(
+                    f"Task {task.get('name', '')!r} uses {module}, which needs a file "
+                    "this pipeline never creates (only tasks/main.yml is written - no "
+                    "templates/ directory exists). Every task must be self-contained "
+                    "(e.g. ansible.builtin.copy with inline content:, not template or "
+                    "copy's src:) - this would otherwise fail deep inside a live VM "
+                    "boot instead of failing fast here.",
+                    raw_output,
+                )
+        copy_args = task.get("ansible.builtin.copy")
+        if isinstance(copy_args, dict) and "src" in copy_args and "content" not in copy_args:
+            raise AnsibleParseError(
+                f"Task {task.get('name', '')!r} uses ansible.builtin.copy with src: "
+                "(a file read from the Ansible controller), which this pipeline never "
+                "creates. Use content: with the literal text inline instead.",
+                raw_output,
+            )
+
+
+# Known CLI tools that block waiting for interactive stdin input -
+# Ansible's shell/command modules attach none, so any of these hang
+# forever instead of failing. Confirmed live: a database-misconfiguration
+# spec's `ansible.builtin.shell: mysql_secure_installation` task hung for
+# 10+ minutes with zero log progress until interrupted by hand - the same
+# class of bug as the very first one this project ever hit (the Vagrant
+# Hyper-V switch-selection prompt hang, week 3), just one layer deeper
+# (inside the guest's own provisioning, not the host's `vagrant up`).
+# Unlike every other rejection in this module, this failure mode doesn't
+# fail loudly - it hangs silently with no timeout, which is worse: no
+# error message, nothing to read except a stalled log. Caught here
+# instead, in under a second, rather than left to hang indefinitely on a
+# live boot. See docs/METHODOLOGY.md (week 6).
+_INTERACTIVE_COMMANDS = ("mysql_secure_installation",)
+_SHELL_MODULES = ("ansible.builtin.shell", "ansible.builtin.command")
+
+
+def _reject_interactive_commands(tasks: list[dict], raw_output: str) -> None:
+    for task in tasks:
+        for module in _SHELL_MODULES:
+            value = task.get(module)
+            if isinstance(value, str):
+                command_text = value
+            elif isinstance(value, dict):
+                command_text = str(value.get("cmd", ""))
+            else:
+                continue
+            for interactive_command in _INTERACTIVE_COMMANDS:
+                if interactive_command in command_text:
+                    raise AnsibleParseError(
+                        f"Task {task.get('name', '')!r} runs {interactive_command!r} via "
+                        f"{module}, which prompts interactively - Ansible provides no "
+                        "stdin, so it hangs forever instead of failing. Use a "
+                        "non-interactive equivalent instead (e.g. the "
+                        "community.mysql.mysql_user module directly, not "
+                        "mysql_secure_installation).",
+                        raw_output,
+                    )
+
+
+# Module names confirmed to not exist in Ansible at all (not "not
+# resolvable in this pipeline," like the FQCN issue derive_checks_from_role()
+# and this module's other checks deal with, but plainly invented -
+# `ansible.builtin.firewall` is not a real module in ansible.builtin, any
+# other bundled collection, or the wider Ansible ecosystem). Confirmed
+# live: a database-misconfiguration spec used it trying to disable a
+# firewall, and failed with "couldn't resolve module/action" ~10 minutes
+# into a live boot - on a run whose retrieved corpus snippets happened
+# not to include the knowledge base's own ufw guidance
+# (ansible_tasks/manage_ufw_firewall_rule.md), leaving the LLM
+# ungrounded for that one task and it invented a module rather than
+# omitting it. A short, closed list of confirmed-nonexistent names, same
+# philosophy as every other check in this module - not an attempt to
+# validate against the full space of real Ansible modules, which would
+# need actual module introspection (ansible-doc), not a hardcoded list.
+_NONEXISTENT_MODULES = {
+    "ansible.builtin.firewall": "community.general.ufw (Ubuntu) or ansible.posix.firewalld (RHEL-family)",
+}
+
+
+def _reject_nonexistent_modules(tasks: list[dict], raw_output: str) -> None:
+    for task in tasks:
+        for module, real_alternative in _NONEXISTENT_MODULES.items():
+            if module in task:
+                raise AnsibleParseError(
+                    f"Task {task.get('name', '')!r} uses {module!r}, which does not "
+                    f"exist in Ansible at all - not a resolution issue, an invented "
+                    f"module name. Use {real_alternative} instead.",
+                    raw_output,
+                )
 
 
 def write_ansible_role(raw_output: str, run_dir: Path, role_name: str = "training_vm") -> tuple[Path, list[str]]:

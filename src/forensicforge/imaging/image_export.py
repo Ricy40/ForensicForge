@@ -101,8 +101,20 @@ def convert_to_vmdk(vhdx_path: Path) -> Path:
 
 def export_scenario_image(run_dir: Path, vm_name: str) -> Path:
     """Export `vm_name`'s disk and convert it to VMDK. Returns the VMDK
-    path; the intermediate VHDX (run_dir/image.vhdx) is kept alongside it
-    rather than deleted, in case Hyper-V-native reuse is ever wanted too.
+    path.
+
+    The intermediate VHDX (run_dir/image.vhdx) is deleted once conversion
+    succeeds, not kept alongside the VMDK - each of the two is a full,
+    uncompressed copy of the same multi-GB disk (~11GB VHDX + ~6GB VMDK,
+    confirmed against a real run), and the VMDK is the actual deliverable
+    (importable into VirtualBox/VMware; the VHDX isn't, without another
+    conversion step). Keeping both was a real, avoidable disk-space
+    problem for anyone running more than a couple of scenarios back to
+    back - confirmed in practice, not hypothetically, running a multi-spec
+    evaluation batch. If conversion fails, the VHDX is left in place -
+    it's the only copy of the disk at that point, not a redundant one.
     """
     vhdx_path = export_vhdx(vm_name, run_dir)
-    return convert_to_vmdk(vhdx_path)
+    vmdk_path = convert_to_vmdk(vhdx_path)
+    vhdx_path.unlink()
+    return vmdk_path
