@@ -1816,20 +1816,164 @@ provider attribute against Vagrant's own `config.rb` source before
 relying on it, having been burned once already this project assuming a
 provider option existed (`vmswitch`, week 5) that didn't.
 
-**Honestly: the export step is unverified against a real boot as of this
-version.** Every other Hyper-V-touching mechanism in this project needed
-at least one round of live iteration before it worked - the switch prompt
-hang, the privileged-shell-provisioner bug, `test_deploy()` not always
-destroying, and others, all in the dedicated bug lists above. There is no
-reason to expect `Export-VM`/`qemu-img` to be different, and no claim
-here that it is. What's solid: `test_deploy()`'s new hook mechanism
-(unit-tested, including that a hook failure still lets `destroy()` run),
-and the `vmname` Vagrantfile change (confirmed rendering correctly for a
-real run). What's not yet proven: whether `Export-VM` succeeds against a
-Vagrant-managed Hyper-V VM the way it's called here, and whether the
-resulting VMDK actually opens cleanly in VirtualBox or VMware - both
-need the user's own elevated terminal and a live `build-scenario` run to
-find out, the same as everything else this project has needed it for.
+**Update: proven, on the fifth live attempt.** The first four
+`build-scenario` runs each failed before reaching image export at all -
+see the four dedicated bug write-ups below, one per attempt (a real
+transient-turned-code-bug in `extract_yaml_block()`, a claim-matching
+bug, and the pip-install fix needing its own follow-up fix). The fifth
+attempt went all the way through: generation, claim verification (`Port
+2222` and `PasswordAuthentication yes` both true and attributed
+`"changed"`; `PermitRootLogin yes` and `X11Forwarding yes` both true but
+attributed `"ok"` - correctly excluded from the storyline, the exact
+week 3 gap this whole thread exists to catch, confirmed again on this
+run), storyline construction (`Port 2222` correctly picked as the entry
+vector), a final boot with `config_verified: True` and
+`artefacts_verified: True`, and `Export-VM` + `qemu-img` producing a real
+`image.vmdk` - confirmed genuine, not just present, via its file magic
+(`file` reports "VMware4 disk image", and the bytes start with `KDMV`,
+VMDK's actual sparse-extent header signature) rather than trusting the
+file's existence alone. `Export-VM`, the `vmname` lookup, and the
+VHDX→VMDK conversion all worked exactly as designed on the first real
+attempt at each, once the four earlier, unrelated failures (generation
+parsing, claim matching, Ansible's own install step) were out of the
+way. One command, one prompt, a verified scenario description plus a
+real, portable VM image - the definition of done for this thread.
+Opening the resulting `.vmdk` in VirtualBox/VMware itself is the one
+remaining unverified link, left to whenever there's a reason to check it.
+
+### The first real `build-scenario` run: two more bugs, both fixed
+
+The first live attempt failed before reaching image export at all, and
+the failure surfaced two more real, distinct bugs.
+
+**The actual boot failure** was the same PPA-resolution error the
+audit-logging run hit in the earlier week 6 live-results section
+(`Cannot add PPA: 'ppa:~ansible/ubuntu/ansible' ... '~ansible' user or
+team does not exist`) - Vagrant's `ansible_local` provisioner's default
+install path adds `ppa:ansible/ansible` to get a newer Ansible than
+Ubuntu's own repos ship, and that add failed. Hitting the *identical*
+error independently on two different runs (different specs, different
+days) moved this from "worth documenting as transient" to "worth actually
+avoiding": `ansible_local` has a real, documented `install_mode` option
+(confirmed against HashiCorp's own docs, not assumed) - `"pip"` installs
+Ansible from PyPI instead, bypassing the PPA and Launchpad entirely.
+Added to `VAGRANTFILE_TEMPLATE`. Not yet re-verified live (needs another
+real boot to confirm pip installs cleanly on the box image), but grounded
+in a real, confirmed option rather than a guess.
+
+**The more interesting bug was in how the failure was reported, not in
+the boot itself.** All four claims printed as `[FALSE]`, which read as
+"every single claimed misconfiguration in this role is fake" - a
+plausible-sounding but wrong conclusion (two of the four were genuine:
+`Port 2222`, `PermitRootLogin yes`; the boot failing meant *none* of the
+four were ever actually checked at all). The bug: `finding.actual` is
+`None` for a claim whose check never ran, same as it would be for one
+that isn't checkable - but `build_scenario_cmd`'s display logic
+(`"TRUE" if finding.actual else "FALSE"`) treats `None` as falsy, so
+"never checked" and "checked and confirmed false" printed identically.
+`build_scenario_cmd` also didn't print `finding.note` or the run's
+overall error at all (unlike the standalone `verify-vulnerabilities`
+command, which already had both) - so there was no visible trace of *why*
+every claim came back looking false, either. Fixed: a shared
+`_vulnerability_mark()` helper now distinguishes TRUE / FALSE / N/A
+(verifiable, but never reached) / SKIP (not verifiable at all), used by
+every command that prints findings; `build_scenario_cmd` now prints
+`finding.note` and the run's error the same way `verify-vulnerabilities`
+already did. A UI/reporting bug, not a detection bug - the underlying
+`VulnerabilityReport` already carried the right data (`error`,
+`finding.note`) the whole time; only the terminal output was misleading.
+
+Also noticed, not yet acted on: this run's own "Applied misconfigurations"
+claims included two directives that are hardening measures, not
+weaknesses (`X11Forwarding no`, `PasswordAuthentication no`), each
+justified with reasoning that describes *reduced* risk while still
+calling them "misconfigurations." A fourth, distinct flavor of LLM
+content unreliability on top of the three already found and repaired
+this week - this one about the *claims' own semantic correctness* rather
+than their YAML syntax or module usage. Not repaired (repair.py's
+narrow-list philosophy applies here too: this would need actually
+judging which SSH directives are hardening vs. weakening, a materially
+bigger and fuzzier task than the three structural fixes above) - flagged
+here, and in Known limitations below, as a finding rather than a fix.
+
+### The second `build-scenario` attempt: a real bug in this project's own extraction code
+
+With `install_mode = "pip"` in place, the second live attempt failed
+before even reaching a boot - `extract_yaml_block()` couldn't parse the
+YAML at all, on output that read as perfectly valid YAML by eye:
+`mapping values are not allowed here` at the second task's module key.
+
+The actual cause, found by inspecting the *extracted* string directly
+rather than the raw LLM output (the raw output looked completely
+reasonable): this generation wrapped the whole ` ```yaml ` fence inside a
+numbered markdown list item (`1. ```yaml`), so every line inside the
+fence carried three extra leading spaces from that list nesting.
+`extract_yaml_block()` called a bare `.strip()` on the captured block -
+which trims whitespace only from the very start and end of the *whole
+string*, not per line. That removes the first line's leading spaces (so
+`- name: ...` starts at column 0) but leaves every other line's
+indentation untouched (`ansible.builtin.lineinfile:` still five spaces
+in) - desyncing the first task's module key from its own `name:` sibling
+by one indent level, which is exactly the shape of error PyYAML reported.
+A bug in this project's own extraction code, not in the LLM's output -
+the YAML the LLM wrote was internally consistent; the code just chose the
+wrong substring of it to keep. Fixed with `textwrap.dedent()` (removes
+the common leading whitespace from every line uniformly, so relative
+indentation survives regardless of how deeply the fence itself was
+nested) instead of a bare `.strip()`. Verified against the exact real
+broken output (regression test) and against three fresh live re-rolls of
+the same spec afterward, all clean.
+
+### The third attempt: claim matching was too dependent on *where* the LLM put backticks
+
+With the YAML fix in place, generation and role-writing succeeded, but
+`verify-vulnerabilities` reported every claim `NOT VERIFIABLE` - on a
+role that plainly did contain matching `lineinfile` tasks. The real
+generation this time formatted its claims as
+`` **PermitRootLogin yes (`source: misconfigurations/weak_ssh_root_login.md`)** - ... ``:
+the directive itself in **bold**, and the *only* backtick span used for
+a source citation instead. `_match_claim()` only ever looked inside
+backtick spans for a directive to compare against tasks - so it compared
+`"source: misconfigurations/weak_ssh_root_login.md"` (the citation)
+against every task's `line:` value, which of course never matched
+anything, even though the literal text `PermitRootLogin yes` was sitting
+right there in the claim, just not inside backticks this time.
+
+Fixed by inverting the match direction: instead of extracting a
+candidate directive from the claim and searching for it, `_match_claim()`
+now checks whether each task's own `line:` value appears anywhere in the
+claim's *whole* text, regardless of whatever formatting (backticks,
+bold, plain) the LLM wrapped it in. Verified against the exact real
+failing run's `generation.md` directly (all three claims now match their
+correct task) and covered by a regression test. This is the second
+matching-related fix this week (the first was the prompt asking for
+backtick-quoting, week 6's original section above) - between the two,
+the lesson is the same one week 5 and 6's other fixes keep confirming:
+trust the mechanism, not the LLM's formatting consistency, for anything
+this project needs to parse back out of generated prose.
+
+### The fourth attempt: the pip fix needed its own fix
+
+With claim matching correct, the fourth attempt reached a real boot -
+and the `install_mode = "pip"` fix from two attempts ago failed in a new
+way of its own: its default bootstrap command
+(`curl https://bootstrap.pypa.io/get-pip.py | sudo python`) failed live,
+because `get-pip.py` itself has dropped support for anything older than
+Python 3.10, and `generic/ubuntu2004` ships Python 3.8. The failure was
+at least easy to fix correctly: the script's own error output names the
+fix (a version-pinned URL, `bootstrap.pypa.io/pip/3.8/get-pip.py`), and
+`ansible_local` has a real, documented `pip_install_cmd` override for
+exactly this (confirmed against HashiCorp's docs before using it, not
+assumed). Set to the pinned URL, keeping the same bare `python` invocation
+the failing run had already proven resolves on this box (it got far
+enough to run `get-pip.py` and have *that* reject the Python version -
+`python` itself was never in question). Not yet re-verified live.
+
+This run's `[N/A]` display (introduced two attempts ago, for exactly
+this "the VM never reached this check" situation) worked correctly this
+time - a real boot failure showed as `N/A` with a clear note and the
+actual `vagrant up` error, not a misleading `FALSE`. One fewer thing to
+debug blind next time.
 
 ## Libraries and tools
 
@@ -2078,15 +2222,39 @@ scenario uses (hosted runners support it natively); **WSL2** is what
   now live-verified (this run hit it for real), which is a real, useful
   result on its own, but a second successful full chain (ideally through
   a non-SSH entry vector, since the SSH one already worked) remains open.
-- `build-scenario`'s image-export step (`imaging/image_export.py`,
-  `Export-VM` + `qemu-img`) has not been through a live boot yet - see
-  its own dedicated section above for exactly what is and isn't proven
-  so far. Needs a real `build-scenario` run, with `qemu-utils` installed
-  in WSL first (`scripts/check_wsl_tools.py` prints the exact command),
-  to find out whether it actually works.
+- `build-scenario`'s image-export step is now live-verified (`Export-VM`
+  + `qemu-img` produced a real, valid `image.vmdk` - confirmed via its
+  file magic, not just its existence - on the fifth live attempt; see
+  the dedicated section above). Not yet verified: whether the resulting
+  `.vmdk` actually opens cleanly as a new VM's disk in VirtualBox or
+  VMware - the export mechanism works, but nothing has opened the file
+  it produces in either target application yet.
 - `provision/repair.py`'s repair list is deliberately closed and narrow -
   three specific, real bug shapes, not a general YAML/Ansible-correctness
   checker. A generation bug of a different shape (there is no reason to
   expect the three found so far are the only ones the corpus can produce)
   fails exactly as before, with no repair attempted, until it's found and
   a fourth pattern is added.
+- The first `build-scenario` run found that a role's "Applied
+  misconfigurations" claims can be *semantically* wrong, not just
+  unparseable or unmatched to a checkable task: two of four claims in
+  one real run described hardening measures (`X11Forwarding no`,
+  `PasswordAuthentication no`) as if they were weaknesses, with reasoning
+  text that plainly describes reduced risk while still calling them
+  misconfigurations. verify-vulnerabilities only checks whether a claimed
+  directive actually landed on the VM and who's responsible - it has no
+  way to judge whether the claim itself makes security sense, and
+  doesn't attempt to (see the dedicated week 6 section above for why this
+  wasn't added to repair.py). A role whose claims are internally
+  contradictory like this would currently pass verify-vulnerabilities'
+  scrutiny for the true/attributable ones and just get NOT-checked for
+  the mislabeled ones - nothing catches the mislabeling itself.
+- Vagrant's `ansible_local` provisioner's default Ansible-install path
+  (PPA-based) failed live, independently, on two different runs this
+  week with the same error; `install_mode = "pip"` traded it for a
+  different failure (`get-pip.py` rejecting the box's Python 3.8); a
+  pinned `pip_install_cmd` fixed that too - all three now confirmed live
+  on the fifth `build-scenario` attempt, which completed a full boot
+  and provisioning run without hitting any Ansible-install failure. Not
+  a guarantee against a *fourth* variant, but no longer just "grounded,
+  not proven."

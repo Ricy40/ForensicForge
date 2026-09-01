@@ -5,6 +5,8 @@ import pytest
 from forensicforge.validate.vulnerabilities import (
     VulnerabilityFinding,
     VulnerabilityReport,
+    _lineinfile_tasks,
+    _match_claim,
     parse_applied_misconfigurations,
     verify_vulnerabilities,
 )
@@ -168,6 +170,36 @@ def test_claim_false_on_live_vm(tmp_path, monkeypatch):
     finding = result.findings[0]
     assert finding.actual is False
     assert "NOT TRUE" in finding.note
+
+
+def test_matches_a_claim_whose_directive_is_bold_not_backticked(tmp_path):
+    """Regression test for a real failure: a live run wrapped the actual
+    directive in **bold** and used its only backtick span for an
+    unrelated source citation (`` `source: misconfigurations/weak_ssh_root_login.md` ``),
+    which made backtick-only matching pick up the citation as if it were
+    the directive - never matching any task. Matching now searches the
+    claim's whole text for a task's line value, independent of whatever
+    the LLM chose to backtick or bold."""
+    role_dir = _write_role_tasks(
+        tmp_path,
+        "- name: Enable root login with password authentication\n"
+        "  ansible.builtin.lineinfile:\n"
+        "    path: /etc/ssh/sshd_config\n"
+        "    line: PermitRootLogin yes\n",
+    )
+    raw_output = (
+        "```yaml\nfiller\n```\n\n"
+        "**Applied misconfigurations:**\n\n"
+        "1. **PermitRootLogin yes (`source: misconfigurations/weak_ssh_root_login.md`)** - "
+        "a real vulnerability due to the risk of brute-force attacks on the root account.\n"
+    )
+    claims = parse_applied_misconfigurations(raw_output)
+    lineinfile_tasks = _lineinfile_tasks(role_dir)
+    task, directive = _match_claim(claims[0], lineinfile_tasks)
+
+    assert task is not None
+    assert task["name"] == "Enable root login with password authentication"
+    assert directive == "PermitRootLogin yes"
 
 
 def test_unmatchable_claim_is_reported_not_skipped(tmp_path):

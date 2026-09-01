@@ -233,6 +233,28 @@ def test_deploy_cmd(run_dir: Path, role_name: str, scenario_id: str | None, stor
     click.echo(f"\nWrote {run_dir / config.REPORT_FILENAME}")
 
 
+def _vulnerability_mark(finding) -> str:
+    """[TRUE]/[FALSE]/[N/A]/[SKIP] for one VulnerabilityFinding.
+
+    `finding.actual` is None in two genuinely different situations that
+    both need to read as neither TRUE nor FALSE: the VM never reached
+    this check at all (a boot failure - see finding.note for why), or the
+    claim wasn't verifiable in the first place. Treating None the same as
+    False (`"TRUE" if finding.actual else "FALSE"`, the original version
+    of this) silently relabels "we never found out" as a confirmed
+    negative result - confirmed as a real, live, actively misleading bug:
+    a `vagrant up` failure (an unrelated Ansible-install PPA problem, not
+    a config claim being false) made every claim print as [FALSE] with no
+    visible indication the VM never actually booted. See
+    docs/METHODOLOGY.md (week 6).
+    """
+    if not finding.verifiable:
+        return "SKIP"
+    if finding.actual is None:
+        return "N/A "
+    return "TRUE" if finding.actual else "FALSE"
+
+
 @main.command(name="verify-vulnerabilities")
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--role-name", default="training_vm", help="Role name within run_dir/roles/.")
@@ -262,8 +284,7 @@ def verify_vulnerabilities_cmd(run_dir: Path, role_name: str) -> None:
     click.echo(f"  booted:    {result.booted}")
     click.echo(f"  destroyed: {result.destroyed}")
     for finding in result.findings:
-        mark = "SKIP" if not finding.verifiable else ("TRUE" if finding.actual else "FALSE")
-        click.echo(f"  [{mark}] {finding.claim}")
+        click.echo(f"  [{_vulnerability_mark(finding)}] {finding.claim}")
         click.echo(f"         {finding.note}")
     if result.error:
         click.echo(f"  error: {result.error}", err=True)
@@ -305,9 +326,13 @@ def forensic_scenario_from_run_cmd(run_dir: Path, role_name: str) -> None:
         click.echo(str(exc), err=True)
         raise SystemExit(1)
 
+    click.echo(f"  booted:    {vuln_report.booted}")
+    click.echo(f"  destroyed: {vuln_report.destroyed}")
     for finding in vuln_report.findings:
-        mark = "SKIP" if not finding.verifiable else ("TRUE" if finding.actual else "FALSE")
-        click.echo(f"  [{mark}] {finding.claim}")
+        click.echo(f"  [{_vulnerability_mark(finding)}] {finding.claim}")
+        click.echo(f"         {finding.note}")
+    if vuln_report.error:
+        click.echo(f"  error: {vuln_report.error}", err=True)
 
     try:
         storyline = build_storyline_from_vulnerabilities(vuln_report, spec=spec, run_id=run_dir.name)
@@ -374,9 +399,13 @@ def build_scenario_cmd(spec: str, role_name: str) -> None:
     except FileNotFoundError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1)
+    click.echo(f"  booted:    {vuln_report.booted}")
+    click.echo(f"  destroyed: {vuln_report.destroyed}")
     for finding in vuln_report.findings:
-        mark = "SKIP" if not finding.verifiable else ("TRUE" if finding.actual else "FALSE")
-        click.echo(f"  [{mark}] {finding.claim}")
+        click.echo(f"  [{_vulnerability_mark(finding)}] {finding.claim}")
+        click.echo(f"         {finding.note}")
+    if vuln_report.error:
+        click.echo(f"  error: {vuln_report.error}", err=True)
 
     click.echo("\nBuilding a forensic storyline from what actually verified ...")
     try:

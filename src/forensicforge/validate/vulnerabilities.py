@@ -99,26 +99,32 @@ def _lineinfile_tasks(role_dir: Path) -> list[dict]:
 
 
 def _match_claim(claim: ClaimedVulnerability, lineinfile_tasks: list[dict]) -> tuple[dict | None, str | None]:
-    """Find the lineinfile task (if any) a claim's directive refers to.
+    """Find the lineinfile task (if any) a claim refers to.
 
-    Matching is against the task's own `line:` value - the literal text
-    the task actually writes - not against the claim's prose, since
-    that's the one thing on both sides that's meant to be the same
-    string. Only lineinfile is covered: it's the only module in the
-    knowledge corpus (and every generated role seen so far) that makes a
-    single, individually-checkable claim per task - see
-    derive_checks_from_role()'s own docstring in test_deploy.py for the
-    same reasoning. A claim whose directive doesn't match any lineinfile
-    task's line is reported as unverifiable, not silently dropped or
-    guessed at.
+    Matches by checking whether a task's own `line:` value - the literal
+    text the task actually writes - appears verbatim anywhere in the
+    claim's full text, rather than only within backtick-quoted spans.
+    The prompt asks the LLM to backtick-quote the exact directive per
+    claim (see prompts.py), but real generations don't consistently put
+    the *directive* there - one live run wrapped the directive in
+    **bold** instead and used its only backtick span for an unrelated
+    source citation (`` `source: misconfigurations/weak_ssh_root_login.md` ``),
+    which made every claim in that run unmatchable under backtick-only
+    matching even though the directive text was sitting right there in
+    the claim. Searching the whole claim text is robust to wherever the
+    LLM chooses to put emphasis formatting. Only lineinfile is covered:
+    it's the only module in the knowledge corpus (and every generated
+    role seen so far) that makes a single, individually-checkable claim
+    per task - see derive_checks_from_role()'s own docstring in
+    test_deploy.py for the same reasoning. A claim that matches no
+    lineinfile task's line is reported as unverifiable, not silently
+    dropped or guessed at.
     """
-    for directive in claim.directives:
-        normalized = " ".join(directive.split())
-        for task in lineinfile_tasks:
-            line = str(task["ansible.builtin.lineinfile"].get("line", ""))
-            normalized_line = " ".join(line.split())
-            if normalized and (normalized == normalized_line or normalized in normalized_line):
-                return task, directive
+    for task in lineinfile_tasks:
+        line = str(task["ansible.builtin.lineinfile"].get("line", ""))
+        normalized_line = " ".join(line.split())
+        if normalized_line and normalized_line in claim.text:
+            return task, normalized_line
     return None, None
 
 
@@ -159,10 +165,8 @@ def verify_vulnerabilities(run_dir: Path, role_dir: Path) -> VulnerabilityReport
         task, directive = _match_claim(claim, lineinfile_tasks)
         if task is None:
             reason = (
-                "claim has no backtick-quoted directive to match against the role's tasks"
-                if not claim.directives else
-                f"claimed directive {claim.directives[0]!r} did not match any "
-                "ansible.builtin.lineinfile task's line in the generated role"
+                "no ansible.builtin.lineinfile task in the generated role writes a line "
+                "that appears anywhere in this claim's text"
             )
             findings.append(VulnerabilityFinding(
                 claim=claim.text,

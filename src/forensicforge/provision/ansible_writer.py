@@ -1,4 +1,5 @@
 import re
+import textwrap
 from pathlib import Path
 
 import yaml
@@ -59,7 +60,22 @@ def extract_yaml_block(raw_output: str) -> str:
         raise AnsibleParseError(
             "No ```yaml code block found in the LLM output.", raw_output
         )
-    return match.group(1).strip()
+    # textwrap.dedent(), not a bare .strip(): when the LLM wraps the whole
+    # fenced block inside a numbered markdown list item (e.g. "1. ```yaml"),
+    # every line in the block carries the same leading indentation from
+    # that list nesting. .strip() only trims the very start/end of the
+    # *whole string* - it removes the first line's leading whitespace but
+    # leaves every other line's indentation untouched, desyncing the first
+    # task's "- name:" from its own sibling keys ("ansible.builtin.X:")
+    # one indent level deeper than it should be relative to "name:".
+    # Confirmed as the actual root cause of a real "mapping values are not
+    # allowed here" failure this week, on output that read as perfectly
+    # valid YAML by eye - the bug was invisible until the exact extracted
+    # string (not the raw LLM output) was inspected directly. dedent()
+    # removes the common leading whitespace from every line uniformly,
+    # so relative indentation survives regardless of how deep the fence
+    # itself was nested. See docs/METHODOLOGY.md (week 6).
+    return textwrap.dedent(match.group(1)).strip()
 
 
 def parse_tasks(yaml_text: str, raw_output: str) -> tuple[list[dict], list[str]]:

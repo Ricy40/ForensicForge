@@ -76,6 +76,31 @@ Vagrant.configure("2") do |config|
   config.vm.provision "ansible_local" do |ansible|
     ansible.playbook = "playbook.yml"
     ansible.provisioning_path = "{provisioning_path}"
+    # Default install_mode uses `add-apt-repository ppa:ansible/ansible`
+    # to get a newer Ansible than Ubuntu's own repos ship. That PPA add
+    # failed live, independently, on two different runs this week with
+    # the same error ("Cannot add PPA: 'ppa:~ansible/ubuntu/ansible' ...
+    # '~ansible' user or team does not exist") - not this project's code,
+    # but frequent enough (2 of a handful of live boots) to be worth
+    # avoiding rather than just retrying past. "pip" installs Ansible
+    # from PyPI instead, bypassing the PPA (and Launchpad) entirely -
+    # confirmed a real install_mode option, not assumed, against
+    # HashiCorp's own ansible_local provisioner docs. See
+    # docs/METHODOLOGY.md (week 6).
+    ansible.install_mode = "pip"
+    # install_mode "pip"'s own default pip_install_cmd
+    # (`curl https://bootstrap.pypa.io/get-pip.py | sudo python`) failed
+    # live on this box (generic/ubuntu2004, Python 3.8): get-pip.py
+    # dropped support for anything older than Python 3.10, and its own
+    # error output names the fix - a version-pinned URL
+    # (bootstrap.pypa.io/pip/3.8/get-pip.py) instead of the generic one.
+    # `pip_install_cmd` is confirmed a real, documented override (not
+    # assumed) against HashiCorp's own docs. Keeps the same `python`
+    # invocation the box already proved resolves (the failing run got far
+    # enough to run get-pip.py itself and have *it* reject the Python
+    # version - "python" was never the problem). See docs/METHODOLOGY.md
+    # (week 6).
+    ansible.pip_install_cmd = "curl https://bootstrap.pypa.io/pip/3.8/get-pip.py | sudo python"
   end
 end
 """
