@@ -3,6 +3,12 @@ from pathlib import Path
 
 import yaml
 
+from .repair import (
+    repair_lineinfile_backreferences,
+    repair_user_module_path_misuse,
+    repair_yaml_text,
+)
+
 YAML_BLOCK_PATTERN = re.compile(r"```ya?ml\s*\n(.*?)```", re.DOTALL)
 
 # Must match the `author:` field below - ansible-compat's local role
@@ -56,11 +62,28 @@ def extract_yaml_block(raw_output: str) -> str:
     return match.group(1).strip()
 
 
-def parse_tasks(yaml_text: str, raw_output: str) -> list[dict]:
+def parse_tasks(yaml_text: str, raw_output: str) -> tuple[list[dict], list[str]]:
+    """Parse `yaml_text` into a task list, applying repair.py's known-shape
+    fixes where they apply. Returns (tasks, repair_notes) - notes is empty
+    when nothing needed fixing. Still raises AnsibleParseError, unchanged,
+    for anything the repairs don't recognize.
+    """
+    repair_notes: list[str] = []
     try:
         tasks = yaml.safe_load(yaml_text)
     except yaml.YAMLError as exc:
-        raise AnsibleParseError(f"Extracted YAML failed to parse: {exc}", raw_output) from exc
+        repaired_text, note = repair_yaml_text(yaml_text, exc)
+        if repaired_text is None:
+            raise AnsibleParseError(f"Extracted YAML failed to parse: {exc}", raw_output) from exc
+        try:
+            tasks = yaml.safe_load(repaired_text)
+        except yaml.YAMLError as retry_exc:
+            raise AnsibleParseError(
+                f"Extracted YAML failed to parse, and an automatic repair attempt "
+                f"({note}) still didn't produce valid YAML: {retry_exc}", raw_output,
+            ) from retry_exc
+        yaml_text = repaired_text
+        repair_notes.append(note)
 
     if not isinstance(tasks, list) or not tasks:
         raise AnsibleParseError("Extracted YAML is not a non-empty list of tasks.", raw_output)
@@ -70,26 +93,40 @@ def parse_tasks(yaml_text: str, raw_output: str) -> list[dict]:
             raise AnsibleParseError(
                 f"Task {i} is not a mapping with a 'name' key: {task!r}", raw_output
             )
-    return tasks
+
+    tasks, backref_notes = repair_lineinfile_backreferences(tasks)
+    repair_notes.extend(backref_notes)
+    tasks, user_path_notes = repair_user_module_path_misuse(tasks)
+    repair_notes.extend(user_path_notes)
+
+    return tasks, repair_notes
 
 
-def write_ansible_role(raw_output: str, run_dir: Path, role_name: str = "training_vm") -> Path:
+def write_ansible_role(raw_output: str, run_dir: Path, role_name: str = "training_vm") -> tuple[Path, list[str]]:
     """Extract, validate, and write RAG output as an Ansible role + playbook.
 
     Nothing is written to disk if extraction or parsing fails - raises
-    AnsibleParseError instead, with the raw LLM output attached.
+    AnsibleParseError instead, with the raw LLM output attached. Returns
+    (role_dir, repair_notes): repair_notes lists any known-shape fixes
+    repair.py applied to the LLM's output before writing it - never
+    applied silently, always surfaced to the caller (see provision_spec()
+    and the `provision` CLI command). The written tasks/main.yml reflects
+    the *repaired* tasks, not the LLM's original, exact text - the
+    original is still recoverable from generation.md.
     """
     yaml_text = extract_yaml_block(raw_output)
-    parse_tasks(yaml_text, raw_output)  # validates; raises on failure, writes nothing
+    tasks, repair_notes = parse_tasks(yaml_text, raw_output)
 
     role_dir = run_dir / "roles" / role_name
     (role_dir / "tasks").mkdir(parents=True, exist_ok=True)
     (role_dir / "meta").mkdir(parents=True, exist_ok=True)
 
-    (role_dir / "tasks" / "main.yml").write_text(yaml_text + "\n", encoding="utf-8")
+    (role_dir / "tasks" / "main.yml").write_text(
+        yaml.dump(tasks, sort_keys=False, default_flow_style=False), encoding="utf-8"
+    )
     (role_dir / "meta" / "main.yml").write_text(ROLE_META_TEMPLATE, encoding="utf-8")
     (run_dir / "playbook.yml").write_text(
         PLAYBOOK_TEMPLATE.format(role_name=role_name), encoding="utf-8"
     )
 
-    return role_dir
+    return role_dir, repair_notes

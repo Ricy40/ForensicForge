@@ -26,9 +26,10 @@ Here is the configuration:
 def test_write_ansible_role_writes_task_and_meta_files(tmp_path):
     run_dir = tmp_path / "20260101-000000"
 
-    role_dir = write_ansible_role(VALID_RAG_OUTPUT, run_dir, role_name="training_vm")
+    role_dir, repairs = write_ansible_role(VALID_RAG_OUTPUT, run_dir, role_name="training_vm")
 
     assert role_dir == run_dir / "roles" / "training_vm"
+    assert repairs == []
     tasks_file = role_dir / "tasks" / "main.yml"
     meta_file = role_dir / "meta" / "main.yml"
     playbook_file = run_dir / "playbook.yml"

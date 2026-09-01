@@ -26,6 +26,18 @@ Vagrant.configure("2") do |config|
   # regardless of the prompt issue.
   config.vm.network "public_network", bridge: "{hyperv_switch}"
 
+  # A deterministic Hyper-V VM name (not Vagrant's own auto-generated
+  # "<dir>_default_<random>" one), so build-scenario's image-export step
+  # (week 6) can find this specific VM by name afterward without needing
+  # to parse Vagrant's internal .vagrant/ state files. `vmname` is a real
+  # Hyper-V-provider config attribute - confirmed against Vagrant's own
+  # plugins/providers/hyperv/config.rb source before relying on it, after
+  # getting burned once already this project assuming a provider option
+  # existed (`vmswitch` - see the switch-selection section above).
+  config.vm.provider "hyperv" do |h|
+    h.vmname = "{hostname}"
+  end
+
   # Copied over SSH rather than relying on a synced folder: VirtualBox needs
   # Guest Additions for its default /vagrant sync, and Hyper-V's equivalent
   # needs an SMB share (host account credentials, set up interactively).

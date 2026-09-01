@@ -1729,6 +1729,108 @@ non-attributable one, both correctly distinguished, is a small sample,
 but it is a *real, live-verified* sample rather than an assertion the
 mechanism works.
 
+### Repairing known LLM-output bugs, and one command instead of four
+
+Two follow-up requests came out of reviewing the week 6 results above:
+fix the generation bugs that were found rather than just document them,
+and collapse the four separate manual commands (`provision`,
+`verify-vulnerabilities`, `forensic-scenario-from-run`,
+`test-deploy --storyline-file`) a full scenario needs into one.
+
+**`provision/repair.py`: a closed, narrow list of known-shape fixes, not
+a general "make the LLM's YAML valid" system.** Three patterns from
+earlier this week get recognized and repaired automatically now:
+
+- The Postgres nested-quote failure (`line: 'listen_addresses = '*''`) -
+  fixed by finding the exact line PyYAML's own parse error points at and
+  re-emitting its value as a properly escaped double-quoted YAML string.
+  Live-tested against a fresh generation of the same spec: it worked, but
+  surfaced a *second*, related failure the fix hadn't accounted for -
+  `line: 'listen_addresses = \'localhost\''`, the LLM applying Python/JS-
+  style backslash escaping that single-quoted YAML has no syntax for at
+  all. The first version of the repair produced technically-valid YAML
+  that still carried the literal, bogus backslashes into the config value
+  it wrote - parseable, but wrong for the file it targets. Fixed by also
+  stripping `\'`/`\"` sequences before re-quoting (single-quoted YAML
+  never has a legitimate use for either), then re-verified live against
+  the same spec a third time - correct output, no backslashes, valid
+  postgresql.conf syntax.
+- The SSH `\1`-backreference misuse (`regexp` capturing
+  `(PermitRootLogin|PasswordAuthentication)`, `line: '\1 yes'`, which
+  `lineinfile`'s `line:` writes literally rather than as a regex
+  replacement) - fixed by splitting one broken task into one task per
+  alternative, each with the backreference resolved to that alternative's
+  own literal name. Verified against the exact real broken YAML captured
+  earlier this week (unit test, not yet re-rolled live - this pattern
+  doesn't depend on PyYAML error-location parsing the way the quote fix
+  does, so it's lower-risk to trust from a unit test alone).
+- The `ansible.builtin.user`/`path:` misuse (a task trying to set
+  directory ownership through the wrong module entirely) - fixed by
+  rewriting it to the `ansible.builtin.file` task it was actually trying
+  to express. Also verified via unit test against the real captured bug,
+  not yet re-rolled live.
+
+Every repair is recorded and surfaced, never applied silently - `provision`
+and `build-scenario` both print "Auto-repaired N known issue(s)" with
+what changed. `tasks/main.yml` on disk reflects the *repaired* tasks;
+the LLM's original, unrepaired text is still recoverable from
+`generation.md` for anyone who wants to see exactly what was fixed.
+Deliberately not attempted: a general repair loop (feed the parse error
+back to the LLM and ask it to fix its own YAML) - that trades one
+unreliable generation step for two, and every pattern found so far has
+had a small, specific, well-understood fix once actually looked at.
+
+**`build-scenario <spec>`: one command, chaining what four used to do
+separately.** `provision` → `verify-vulnerabilities` (its own boot+destroy
+cycle) → `build_storyline_from_vulnerabilities()` → plant the artefact
+role → a final boot that verifies both config and planted evidence. Two
+live boots total, down from the four separate commands' effective total
+of up to four - `verify-vulnerabilities` still needs its own boot (there's
+no way to know what's attributable without watching Ansible apply it
+live), but the final `test-deploy`-equivalent boot now does verification
+*and* image export in the same cycle rather than needing a separate call.
+
+**Image export, the actual new capability behind "give me a file I can
+open in VirtualBox/VMware," not just a recipe.** `test_deploy()` gained a
+`post_verify_hook` parameter - called after checks complete but before
+`destroy()`, the one point a booted, verified VM is guaranteed to still
+exist. `build-scenario` passes a hook that exports the VM's disk
+(`imaging/image_export.py`): Hyper-V's `Export-VM` cmdlet copies the disk
+safely (including a live VM's - unlike a raw file copy, which risks
+reading a locked file, and unlike `Convert-VHD`, which only converts
+between Microsoft's own VHD/VHDX formats), then `qemu-img` (run through
+the existing WSL bridge - not found installed natively on Windows or
+already inside WSL on this machine; `scripts/check_wsl_tools.py` now
+checks for it and prints the one-line install command, same "never
+installs without asking" policy as ansible-lint/Molecule) converts the
+VHDX to VMDK, which both VirtualBox and VMware can import directly as a
+disk. The VM still gets destroyed afterward - the export happens *before*
+that, not instead of it, so the "never leaves a VM running" guarantee
+every other command here has holds for this one too, while still
+producing a real, portable file rather than just a re-runnable recipe.
+A deterministic Hyper-V VM name (`h.vmname` in the Vagrantfile template,
+set to the same hostname `provision_spec()` already generates) makes the
+VM findable by name for export, instead of needing to parse Vagrant's
+own internal `.vagrant/` state - confirmed `vmname` is a real Hyper-V
+provider attribute against Vagrant's own `config.rb` source before
+relying on it, having been burned once already this project assuming a
+provider option existed (`vmswitch`, week 5) that didn't.
+
+**Honestly: the export step is unverified against a real boot as of this
+version.** Every other Hyper-V-touching mechanism in this project needed
+at least one round of live iteration before it worked - the switch prompt
+hang, the privileged-shell-provisioner bug, `test_deploy()` not always
+destroying, and others, all in the dedicated bug lists above. There is no
+reason to expect `Export-VM`/`qemu-img` to be different, and no claim
+here that it is. What's solid: `test_deploy()`'s new hook mechanism
+(unit-tested, including that a hook failure still lets `destroy()` run),
+and the `vmname` Vagrantfile change (confirmed rendering correctly for a
+real run). What's not yet proven: whether `Export-VM` succeeds against a
+Vagrant-managed Hyper-V VM the way it's called here, and whether the
+resulting VMDK actually opens cleanly in VirtualBox or VMware - both
+need the user's own elevated terminal and a live `build-scenario` run to
+find out, the same as everything else this project has needed it for.
+
 ## Libraries and tools
 
 - **FastAPI** — the HTTP interface (`POST /generate`). Chosen over Flask
@@ -1819,6 +1921,15 @@ once the Packer box is actually wired in (still not wired in as of week
 5 — see Known limitations below). **Docker** is what CI's Molecule
 scenario uses (hosted runners support it natively); **WSL2** is what
 `ansible-lint`/Molecule run inside of locally, on Windows.
+- **qemu-img** (week 6) — converts the VHDX `build-scenario` exports from
+  Hyper-V into a VMDK VirtualBox/VMware can import directly
+  (`imaging/image_export.py`). Not found installed natively on Windows or
+  already inside WSL on this machine when checked; runs through the same
+  WSL bridge `ansible-lint`/Molecule already use, since it's a system
+  package (`apt install qemu-utils`), not a Python one -
+  `scripts/check_wsl_tools.py` checks for it and prints the one-line
+  install command rather than installing it unasked, same policy as the
+  other WSL-side tools.
 
 ## Known limitations going into week 7
 
@@ -1826,18 +1937,22 @@ scenario uses (hosted runners support it natively); **WSL2** is what
   left it as - week 6 proved genuinely distinct specs produce genuinely
   distinct roles (SSH bastion, Telnet/firewall, audit-logging/permissions,
   an attempted database spec - see the week 6 section above), not the
-  same SSH content reskinned. What week 6 exposed instead is a *reliability*
-  gap sitting behind that breadth: of four distinct specs tried, one
-  failed to parse as YAML twice in a row (an unescaped `'*'` nested in a
-  quoted PostgreSQL directive), and a second produced a role that failed
-  to apply live (an `ansible.builtin.user` task using a `file`-module-only
-  `path:` parameter). Two of four fresh generations this week had a real,
-  reproducible content bug, on top of the SSH role's own `\1`-backreference
-  bug found by inspection. This is a more precise version of the old
-  "corpus is too narrow" limitation: the corpus retrieves the right
-  *topic* reliably now, but the LLM's ability to correctly operate the
-  Ansible module it picks for that topic is inconsistent, and inconsistent
-  in a different way for each spec so far - not a single fixable bug.
+  same SSH content reskinned. What week 6 exposed instead was a
+  *reliability* gap sitting behind that breadth - three real, reproducible
+  content bugs (a YAML nested-quote failure with two distinct variants, a
+  `\1`-backreference in `lineinfile`'s `line:`, and an
+  `ansible.builtin.user`/`path:` misuse). All three now have an automatic
+  repair (`provision/repair.py`), live-verified for the quote-nesting one
+  (re-rolled the same spec twice more after each fix, both clean), unit-
+  tested against the real captured bugs for the other two. This closes
+  the *specific* instances found, not the underlying reliability gap
+  itself - the repair list is closed and narrow by design (three known
+  shapes, not a general "fix any broken YAML" system), so a fourth,
+  differently-shaped generation bug would fail exactly as before until
+  someone finds it and adds a fourth repair. The corpus retrieves the
+  right *topic* reliably; the LLM's ability to correctly operate the
+  specific Ansible module it picks for that topic remains inconsistent in
+  ways this project can only catch after the fact, one pattern at a time.
 - verify-vulnerabilities (week 6) only checks claims expressed via
   `ansible.builtin.lineinfile`'s `line:` value - the one place a claim and
   a task are guaranteed to say the same string. Real runs this week
@@ -1963,3 +2078,15 @@ scenario uses (hosted runners support it natively); **WSL2** is what
   now live-verified (this run hit it for real), which is a real, useful
   result on its own, but a second successful full chain (ideally through
   a non-SSH entry vector, since the SSH one already worked) remains open.
+- `build-scenario`'s image-export step (`imaging/image_export.py`,
+  `Export-VM` + `qemu-img`) has not been through a live boot yet - see
+  its own dedicated section above for exactly what is and isn't proven
+  so far. Needs a real `build-scenario` run, with `qemu-utils` installed
+  in WSL first (`scripts/check_wsl_tools.py` prints the exact command),
+  to find out whether it actually works.
+- `provision/repair.py`'s repair list is deliberately closed and narrow -
+  three specific, real bug shapes, not a general YAML/Ansible-correctness
+  checker. A generation bug of a different shape (there is no reason to
+  expect the three found so far are the only ones the corpus can produce)
+  fails exactly as before, with no repair attempted, until it's found and
+  a fourth pattern is added.

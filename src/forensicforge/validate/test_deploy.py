@@ -1,6 +1,7 @@
 import contextlib
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -145,8 +146,18 @@ def test_deploy(
     run_dir: Path,
     checks: list[DerivedCheck],
     provider: str = config.VAGRANT_PROVIDER,
+    post_verify_hook: Callable[[], None] | None = None,
 ) -> TestDeployResult:
     """Boot the generated VM, run smoke checks over SSH, then always destroy it.
+
+    `post_verify_hook`, if given, runs after checks complete but before
+    the VM is destroyed - the one point in this function where the VM is
+    guaranteed to still exist and be verified. build-scenario (week 6)
+    uses this to export the VM's disk as a portable image without
+    duplicating this function's boot/check/attribution/destroy logic. A
+    hook failure is recorded in result.error (appended, not replacing a
+    boot/check error already there) rather than raised - destroy() below
+    must still run regardless.
 
     Replaces week 3's manual `vagrant up` / `vagrant ssh` / (never
     destroyed) cycle with a scripted one. Destroy always runs (via
@@ -230,6 +241,13 @@ def test_deploy(
         artefact_checks = [c for c in result.checks if c.category == "artefact"]
         result.config_verified = all(c.matched for c in config_checks) if config_checks else None
         result.artefacts_verified = all(c.matched for c in artefact_checks) if artefact_checks else None
+
+        if post_verify_hook is not None:
+            try:
+                post_verify_hook()
+            except Exception as exc:
+                note = f"post-verify hook failed: {exc}"
+                result.error = f"{result.error}; {note}" if result.error else note
     finally:
         try:
             v.destroy()

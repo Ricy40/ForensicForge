@@ -245,6 +245,65 @@ def test_test_deploy_attribution_lookup_matches_role_prefixed_task_name(tmp_path
     assert result.checks[0].attribution == "changed"
 
 
+def test_test_deploy_runs_post_verify_hook_before_destroy(tmp_path, monkeypatch):
+    """build-scenario (week 6) needs to export the VM's disk while it
+    still exists, after checks but before destroy() runs."""
+    td = sys.modules["forensicforge.validate.test_deploy"]
+    call_order = []
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            pass
+
+        def up(self, provider=None, provision=None):
+            pass
+
+        def ssh(self, command):
+            return ""
+
+        def destroy(self):
+            call_order.append("destroy")
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    def hook():
+        call_order.append("hook")
+
+    result = td.test_deploy(tmp_path, [], post_verify_hook=hook)
+
+    assert call_order == ["hook", "destroy"]
+    assert result.error is None
+
+
+def test_test_deploy_still_destroys_when_post_verify_hook_raises(tmp_path, monkeypatch):
+    td = sys.modules["forensicforge.validate.test_deploy"]
+    destroy_called = []
+
+    class FakeVagrant:
+        def __init__(self, root, out_cm, err_cm, **kwargs):
+            pass
+
+        def up(self, provider=None, provision=None):
+            pass
+
+        def ssh(self, command):
+            return ""
+
+        def destroy(self):
+            destroy_called.append(True)
+
+    monkeypatch.setattr(td.vagrant, "Vagrant", FakeVagrant)
+
+    def failing_hook():
+        raise RuntimeError("export failed")
+
+    result = td.test_deploy(tmp_path, [], post_verify_hook=failing_hook)
+
+    assert destroy_called == [True]
+    assert result.destroyed is True
+    assert "export failed" in result.error
+
+
 def test_test_deploy_destroys_even_when_up_fails(tmp_path, monkeypatch):
     """Regression test: a real run hit this - a provisioner step failed
     partway through `vagrant up` (after the VM was already created), and

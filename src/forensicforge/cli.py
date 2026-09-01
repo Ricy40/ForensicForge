@@ -13,6 +13,7 @@ from .forensics import (
     write_artefact_role,
 )
 from .forensics.scenarios import ALL_SCENARIOS
+from .imaging import export_scenario_image
 from .provision import AnsibleParseError, provision_spec
 from .service import generate_vm_spec
 from .validate import (
@@ -68,6 +69,10 @@ def provision(spec: str) -> None:
         raise SystemExit(1)
 
     click.echo(f"Wrote run '{result.run_id}' to: {result.run_dir}")
+    if result.repairs:
+        click.echo(f"  Auto-repaired {len(result.repairs)} known issue(s) in the generated output:")
+        for note in result.repairs:
+            click.echo(f"    - {note}")
     click.echo(f"  Ansible role:      {result.role_dir}")
     click.echo(f"  Vagrantfile:       {result.vagrantfile}")
     click.echo(f"  Molecule scenario: {result.molecule_scenario}")
@@ -110,6 +115,10 @@ def forensic_scenario_cmd(scenario_id: str | None) -> None:
         raise SystemExit(1)
 
     click.echo(f"Wrote run '{result.provision.run_id}' to: {result.provision.run_dir}")
+    if result.provision.repairs:
+        click.echo(f"  Auto-repaired {len(result.provision.repairs)} known issue(s) in the generated output:")
+        for note in result.provision.repairs:
+            click.echo(f"    - {note}")
     click.echo(f"  Scenario role:  {result.provision.role_dir}")
     click.echo(f"  Artefact role:  {result.artefact_role_dir}")
     click.echo(f"  ({len(storyline.artefacts)} artefact(s) planted)")
@@ -322,6 +331,106 @@ def forensic_scenario_from_run_cmd(run_dir: Path, role_name: str) -> None:
     click.echo(f"Wrote storyline manifest: {storyline_path}")
     click.echo("\nNext:")
     click.echo(f"  forensicforge test-deploy {run_dir} --storyline-file {storyline_path}")
+
+
+@main.command(name="build-scenario")
+@click.argument("spec")
+@click.option("--role-name", default="training_vm", help="Role name within the run's roles/.")
+def build_scenario_cmd(spec: str, role_name: str) -> None:
+    """One prompt in, one forensic scenario out: generate a VM, verify its
+    claimed vulnerabilities live, build a storyline consistent with what
+    actually verified, plant it, and export a portable VM image.
+
+    Replaces the manual `provision` / `verify-vulnerabilities` /
+    `forensic-scenario-from-run` / `test-deploy --storyline-file` sequence
+    with one command. Boots two VMs in sequence (one to verify claimed
+    vulnerabilities, a final one to verify everything and export the
+    image) - each is destroyed afterward, same as every other command
+    here. Requires an elevated terminal (Hyper-V) and WSL with qemu-utils
+    installed (see scripts/check_wsl_tools.py) for the image-export step.
+    The image-export mechanism is new and, as of this version, has not
+    yet been proven against a real boot - see docs/METHODOLOGY.md (week 6).
+    """
+    click.echo(f"Generating a VM for: {spec!r} ...")
+    try:
+        provision_result = provision_spec(spec, role_name=role_name)
+    except AnsibleParseError as exc:
+        click.echo(f"Failed to parse LLM output into a valid Ansible role: {exc}", err=True)
+        click.echo("\n--- Raw LLM output ---\n", err=True)
+        click.echo(exc.raw_output, err=True)
+        raise SystemExit(1)
+
+    run_dir = provision_result.run_dir
+    role_dir = provision_result.role_dir
+    if provision_result.repairs:
+        click.echo(f"  Auto-repaired {len(provision_result.repairs)} known issue(s) in the generated output:")
+        for note in provision_result.repairs:
+            click.echo(f"    - {note}")
+    click.echo(f"  Wrote run '{provision_result.run_id}' to: {run_dir}")
+
+    click.echo("\nVerifying claimed vulnerabilities (boots + destroys a VM) ...")
+    try:
+        vuln_report = verify_vulnerabilities(run_dir, role_dir)
+    except FileNotFoundError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1)
+    for finding in vuln_report.findings:
+        mark = "SKIP" if not finding.verifiable else ("TRUE" if finding.actual else "FALSE")
+        click.echo(f"  [{mark}] {finding.claim}")
+
+    click.echo("\nBuilding a forensic storyline from what actually verified ...")
+    try:
+        storyline = build_storyline_from_vulnerabilities(vuln_report, spec=spec, run_id=provision_result.run_id)
+    except ValueError as exc:
+        click.echo(f"Cannot build a storyline: {exc}", err=True)
+        click.echo(
+            f"The generated VM itself is still usable - see `forensicforge test-deploy {run_dir}`.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    write_artefact_role(storyline, run_dir, scenario_role_name=role_name)
+    storyline_path = run_dir / "storyline.json"
+    save_storyline(storyline, storyline_path)
+    click.echo(f"\n{storyline.title}\n  {storyline.narrative}\n")
+
+    click.echo("Final boot: verifying config + planted evidence, then exporting a portable image ...")
+    checks = derive_checks_from_role(role_dir) + derive_checks_from_storyline(storyline)
+    # Matches vagrantfile_writer.VAGRANTFILE_TEMPLATE's `h.vmname` setting
+    # for this run, which is set to the same hostname provision_spec()
+    # already generates - the deterministic name export_scenario_image()
+    # needs to find this specific Hyper-V VM by name.
+    vm_name = f"forensicforge-{provision_result.run_id}"
+    image_holder: dict[str, Path] = {}
+
+    def _export_hook() -> None:
+        image_holder["path"] = export_scenario_image(run_dir, vm_name)
+
+    result = run_test_deploy(run_dir, checks, post_verify_hook=_export_hook)
+
+    click.echo(f"  booted:             {result.booted}")
+    click.echo(f"  config_verified:    {result.config_verified}")
+    click.echo(f"  artefacts_verified: {result.artefacts_verified}")
+    if result.error:
+        click.echo(f"  error: {result.error}", err=True)
+
+    report = {"run_id": provision_result.run_id, "scans": None, "molecule": None}
+    report["vulnerabilities"] = vuln_report.to_dict()
+    report["test_deploy"] = result.to_dict()
+    write_report(report, run_dir)
+
+    click.echo("\n=== Scenario ready ===")
+    click.echo(f"{storyline.title}\n{storyline.narrative}\n")
+    image_path = image_holder.get("path")
+    if image_path is not None:
+        click.echo(f"Portable VM image: {image_path}")
+        click.echo("Import the .vmdk into VirtualBox/VMware as a new VM's disk to use it.")
+    else:
+        click.echo(
+            f"Image export did not complete - see the error above. The role/Vagrantfile "
+            f"in {run_dir} can still be run manually with `vagrant up`.", err=True,
+        )
+    click.echo(f"\nWrote {run_dir / config.REPORT_FILENAME}")
 
 
 @main.command(name="check-packer")

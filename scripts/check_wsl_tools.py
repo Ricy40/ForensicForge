@@ -21,6 +21,14 @@ TOOLS_VENV = "~/.forensicforge-tools"  # keep in sync with config.WSL_TOOLS_VENV
 TOOLS = ["ansible-lint", "molecule"]
 INSTALL_CMD = "pip install -q ansible-lint molecule 'molecule-plugins[vagrant]'"
 
+# qemu-img converts the VHDX Hyper-V produces into a VMDK that VirtualBox/
+# VMware can open directly (build-scenario's image-export step, week 6) -
+# a system package (`apt`), not a Python one, so it doesn't belong in
+# TOOLS_VENV alongside ansible-lint/molecule. Neither a native Windows
+# build nor WSL already had it on this machine when checked - see
+# docs/METHODOLOGY.md.
+QEMU_IMG_PACKAGE = "qemu-utils"
+
 # molecule-plugins' vagrant driver manages instances via its own bundled
 # Ansible `vagrant` module (molecule_plugins/vagrant/modules/vagrant.py),
 # not one from ansible-core or a galaxy collection - the `community.vagrant`
@@ -123,6 +131,16 @@ def main() -> int:
         else:
             print(f"Skipped. Install manually later with: wsl -- {TOOLS_VENV}/bin/{INSTALL_CMD}")
             return 1
+
+    if wsl("which qemu-img").returncode == 0:
+        print("qemu-img is already installed.")
+    else:
+        print(
+            f"\nqemu-img isn't installed - needed for build-scenario's image-export "
+            f"step (VHDX -> VMDK). It's a system package, so this script can't supply "
+            f"the sudo password apt needs - run this yourself in a WSL terminal:\n\n"
+            f"    sudo apt update && sudo apt install -y {QEMU_IMG_PACKAGE}\n"
+        )
 
     vagrant_link = wsl(f"test -L {TOOLS_VENV}/bin/vagrant")
     if vagrant_link.returncode == 0:

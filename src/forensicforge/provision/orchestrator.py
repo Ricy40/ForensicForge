@@ -21,6 +21,7 @@ class ProvisionResult:
     vagrantfile: Path
     molecule_scenario: Path
     raw_output: str
+    repairs: list[str]
 
 
 def provision_spec(spec: str, role_name: str = "training_vm") -> ProvisionResult:
@@ -45,7 +46,7 @@ def provision_spec(spec: str, role_name: str = "training_vm") -> ProvisionResult
     (run_dir / config.SPEC_FILENAME).write_text(spec, encoding="utf-8")
     (run_dir / config.GENERATION_FILENAME).write_text(result.output, encoding="utf-8")
 
-    role_dir = write_ansible_role(result.output, run_dir, role_name=role_name)
+    role_dir, repairs = write_ansible_role(result.output, run_dir, role_name=role_name)
     vagrantfile = write_vagrantfile(run_dir, hostname=f"forensicforge-{run_id}")
     molecule_scenario = write_molecule_scenario(role_dir, role_name=role_name)
 
@@ -56,4 +57,5 @@ def provision_spec(spec: str, role_name: str = "training_vm") -> ProvisionResult
         vagrantfile=vagrantfile,
         molecule_scenario=molecule_scenario,
         raw_output=result.output,
+        repairs=repairs,
     )
