@@ -1,12 +1,16 @@
 import sys
 
 import pytest
+import yaml
 
 from forensicforge.validate.vulnerabilities import (
     VulnerabilityFinding,
     VulnerabilityReport,
     _lineinfile_tasks,
     _match_claim,
+    _match_mode_claim,
+    _mode_tasks,
+    _normalize_octal_mode,
     parse_applied_misconfigurations,
     verify_vulnerabilities,
 )
@@ -255,6 +259,94 @@ def test_unmatchable_claim_is_reported_not_skipped(tmp_path):
     assert "NOT VERIFIABLE" in result.findings[0].note
 
 
+# --- mode-based claims (ansible.builtin.file/copy's mode:) ---
+# Added after two of seven real evaluation-round specs (privilege
+# escalation: world-writable sudoers entry + misconfigured SUID binary)
+# came back entirely unverifiable - every claim they produced was a
+# mode: value on file/copy tasks, none a lineinfile line, so the
+# lineinfile-only mechanism found nothing checkable in either run.
+
+PRIVESC_TASKS_YAML = """\
+- name: Create a world-writable file in /etc/sudoers.d
+  ansible.builtin.file:
+    path: /etc/sudoers.d/world_writable
+    state: touch
+    mode: '0777'
+    owner: root
+    group: root
+- name: Add a misconfigured SUID binary to the system
+  ansible.builtin.copy:
+    content: 'placeholder'
+    dest: /usr/local/bin/misconfig_suid
+    mode: '04755'
+    owner: root
+    group: root
+"""
+
+RAW_OUTPUT_PRIVESC = f"""\
+```yaml
+{PRIVESC_TASKS_YAML}```
+
+**Applied misconfigurations**:
+1. `path: /etc/sudoers.d/world_writable` sets world-writable permissions (`0777`) on a file in `/etc/sudoers.d`.
+2. `mode: '04755'` on the SUID binary makes it executable by all users and allows setuid.
+"""
+
+
+def test_normalize_octal_mode_strips_leading_zero_and_matches_stat_output():
+    assert _normalize_octal_mode("0777") == "777"
+    assert _normalize_octal_mode("04755") == "4755"
+    assert _normalize_octal_mode("not-a-mode") is None
+
+
+def test_match_mode_claim_finds_file_and_copy_tasks(tmp_path):
+    role_dir = _write_role_tasks(tmp_path, PRIVESC_TASKS_YAML)
+    tasks = _mode_tasks(role_dir)
+    claims = parse_applied_misconfigurations(RAW_OUTPUT_PRIVESC)
+
+    assert len(tasks) == 2
+
+    task0, mode0 = _match_mode_claim(claims[0], tasks)
+    assert task0["name"] == "Create a world-writable file in /etc/sudoers.d"
+    assert mode0 == "0777"
+
+    task1, mode1 = _match_mode_claim(claims[1], tasks)
+    assert task1["name"] == "Add a misconfigured SUID binary to the system"
+    assert mode1 == "04755"
+
+
+def test_verify_vulnerabilities_builds_stat_check_for_mode_claim(tmp_path, monkeypatch):
+    role_dir = _write_role_tasks(tmp_path, PRIVESC_TASKS_YAML)
+    (tmp_path / "generation.md").write_text(RAW_OUTPUT_PRIVESC, encoding="utf-8")
+    _mock_vagrant(monkeypatch, CHANGED_TASK_LOG.replace(
+        "training_vm : Allow root login (for pentesting exercise)",
+        "training_vm : Create a world-writable file in /etc/sudoers.d",
+    ), "777\n")
+
+    result = verify_vulnerabilities(tmp_path, role_dir)
+
+    assert result.booted is True
+    world_writable_finding = next(f for f in result.findings if "world_writable" in f.claim)
+    assert world_writable_finding.verifiable is True
+    assert world_writable_finding.actual is True
+    assert "TRUE" in world_writable_finding.note
+
+
+def test_verify_vulnerabilities_mode_claim_false_on_live_vm(tmp_path, monkeypatch):
+    role_dir = _write_role_tasks(tmp_path, PRIVESC_TASKS_YAML)
+    (tmp_path / "generation.md").write_text(RAW_OUTPUT_PRIVESC, encoding="utf-8")
+    _mock_vagrant(monkeypatch, CHANGED_TASK_LOG.replace(
+        "training_vm : Allow root login (for pentesting exercise)",
+        "training_vm : Create a world-writable file in /etc/sudoers.d",
+    ), "644\n")
+
+    result = verify_vulnerabilities(tmp_path, role_dir)
+
+    world_writable_finding = next(f for f in result.findings if "world_writable" in f.claim)
+    assert world_writable_finding.actual is False
+    assert "NOT TRUE" in world_writable_finding.note
+
+
 # --- storyline_builder: entry vector must be verified AND attributed ---
 
 def _finding(**kwargs) -> VulnerabilityFinding:
@@ -331,6 +423,25 @@ def test_build_storyline_classifies_ftp_entry_vector():
 
     assert "FTP" in storyline.title
     assert "vsftpd" in storyline.artefacts[0].content
+
+
+def test_build_storyline_classifies_unattended_upgrade_entry_vector():
+    """Regression test for a real bug: the real Ansible/apt directive is
+    `APT::Periodic::Unattended-Upgrade` (singular "Upgrade"), but the
+    category regex required the plural "Upgrades" - so a genuinely
+    verified, attributed claim about it fell through to the generic
+    fallback description instead of the correct "apt" category, on a
+    real live openssl-scenario run."""
+    report = VulnerabilityReport(booted=True, destroyed=True, findings=[
+        _finding(claim='`APT::Periodic::Unattended-Upgrade "0";` in the `lineinfile` task',
+                  directive='APT::Periodic::Unattended-Upgrade "0";',
+                  task_name="Disable automatic security updates"),
+    ])
+
+    storyline = build_storyline_from_vulnerabilities(report, spec="Ubuntu server", run_id="20260101-000000")
+
+    assert "unpatched" in storyline.title.lower() or "outdated" in storyline.title.lower()
+    assert "a misconfiguration this run's own generation claimed to apply" not in storyline.title
 
 
 def test_build_storyline_unclassified_claim_does_not_duplicate_the_claim_text():

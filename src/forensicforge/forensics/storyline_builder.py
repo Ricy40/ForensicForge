@@ -47,7 +47,7 @@ _ENTRY_VECTORS: list[tuple[re.Pattern, str, str]] = [
      "the web server, left with an exploitable misconfiguration"),
     (re.compile(r"sudoers|\bsuid\b|setuid|privilege.?escalation", re.IGNORECASE), "sudo",
      "a privilege-escalation path left open in the system's own permission configuration"),
-    (re.compile(r"openssl|unattended.?upgrades|apt.?daily|outdated|unpatched", re.IGNORECASE), "apt",
+    (re.compile(r"openssl|unattended.?upgrades?|apt.?daily|outdated|unpatched|dpkg_selections", re.IGNORECASE), "apt",
      "an outdated, unpatched package left unaddressed by automatic updates"),
     (re.compile(r"auditd|rsyslog|\bsyslog\b|audit.?log|logging", re.IGNORECASE), "auditd",
      "the system's own audit logging, left disabled or misdirected"),

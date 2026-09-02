@@ -7,9 +7,11 @@ YAML nested-quote failure (with a backslash-escaping variant), an
 (which that parameter doesn't support - it's written literally), an
 `ansible.builtin.user` task misusing `path:` (a `file`-module parameter),
 a `notify:` key with nowhere to resolve (no `handlers/main.yml` ever
-gets written), and a whole trailing `handlers:` block appended after the
+gets written), a whole trailing `handlers:` block appended after the
 task list (which isn't valid as one YAML document at all, and has the
-same "nowhere to resolve" problem even if it were). None are one-off
+same "nowhere to resolve" problem even if it were), and a task
+mis-indented as a child of its previous sibling instead of the next
+item in the same list. None are one-off
 typos worth patching by hand in a generated role; each is a *pattern*
 the LLM produces repeatably given a similar prompt. This module
 recognizes each pattern generically (by shape, not by matching the exact
@@ -74,6 +76,51 @@ def repair_trailing_handlers_block(yaml_text: str, error: yaml.YAMLError) -> tup
                 f"{line_no + 1} (no handlers file exists for it to belong to)"
             )
     return None, None
+
+
+_INDENTED_LIST_ITEM = re.compile(r"^(\s+)-\s")
+
+
+def repair_misindented_task(yaml_text: str, error: yaml.YAMLError) -> tuple[str | None, str | None]:
+    """Dedent a task that got indented as if it were nested inside its
+    previous sibling task, rather than being the next item in the same
+    top-level task list.
+
+    Real example: `- name: Disable automatic security updates ...` was
+    followed by a correctly-flush `ansible.builtin.package_facts:` block,
+    but the *next* task, `- name: Remove the default sources.list.d
+    file...`, was indented two extra spaces - nested as if it were part
+    of the previous task's own mapping body instead of the next sibling
+    in the task list. PyYAML fails immediately at that line ("expected
+    <block end>, but found '-'"). Fixed by dedenting that line and
+    everything after it by the same excess amount, back to the top-level
+    list's own indentation - safe because this project's generated roles
+    are always a flat top-level task list (no legitimately-nested blocks
+    a real fix could confuse for this bug), and extract_yaml_block()
+    already normalizes the whole block to start at column 0 before this
+    ever runs, so "the rest of the document shifts left by the same
+    excess" is the correct fix, not just a plausible one.
+    """
+    mark = getattr(error, "problem_mark", None)
+    if mark is None:
+        return None, None
+
+    lines = yaml_text.splitlines()
+    if not (0 <= mark.line < len(lines)):
+        return None, None
+    match = _INDENTED_LIST_ITEM.match(lines[mark.line])
+    if match is None:
+        return None, None
+
+    excess = len(match.group(1))
+    fixed_lines = list(lines[:mark.line])
+    for line in lines[mark.line:]:
+        fixed_lines.append(line[excess:] if line.startswith(" " * excess) else line)
+    return "\n".join(fixed_lines), (
+        f"dedented a task starting at line {mark.line + 1} back to the top level "
+        f"(it was indented as a child of the previous task instead of being its own "
+        f"sibling in the task list)"
+    )
 
 
 def repair_yaml_text(yaml_text: str, error: yaml.YAMLError) -> tuple[str | None, str | None]:

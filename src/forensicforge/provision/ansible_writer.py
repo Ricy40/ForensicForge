@@ -7,6 +7,7 @@ import yaml
 from .repair import (
     repair_dangling_notify,
     repair_lineinfile_backreferences,
+    repair_misindented_task,
     repair_trailing_handlers_block,
     repair_user_module_path_misuse,
     repair_yaml_text,
@@ -18,7 +19,7 @@ YAML_BLOCK_PATTERN = re.compile(r"```ya?ml\s*\n(.*?)```", re.DOTALL)
 # than one can be needed for a single generation (confirmed live: a
 # nested-quote issue and a trailing handlers: block in the same output),
 # so parse_tasks() loops through this list repeatedly, not just once.
-_YAML_TEXT_REPAIRS = (repair_yaml_text, repair_trailing_handlers_block)
+_YAML_TEXT_REPAIRS = (repair_yaml_text, repair_trailing_handlers_block, repair_misindented_task)
 _MAX_YAML_REPAIR_ATTEMPTS = 4
 
 # Must match the `author:` field below - ansible-compat's local role

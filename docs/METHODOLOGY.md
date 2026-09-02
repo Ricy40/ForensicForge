@@ -2319,7 +2319,224 @@ calls), a real, separately-scoped feature, not a quick fix. Recorded
 here as a known limitation: a live boot's honesty is only as good as
 this tool's own ability to keep observing it.
 
-## Libraries and tools
+### Extending verification past lineinfile: permission-mode claims
+
+The privilege-escalation spec (a world-writable `/etc/sudoers.d` entry,
+a misconfigured SUID binary) came back entirely unverifiable on its
+first attempt - both claims were `mode:` values on
+`ansible.builtin.file`/`ansible.builtin.copy` tasks (`0777`, `04755`),
+none a `lineinfile` line, so the lineinfile-only mechanism found nothing
+checkable in the whole role. This is the *second* vulnerability class
+this evaluation round hit the same wall on (after the database class's
+`mysql_user` gap, recorded as a limitation above) - two out of seven
+specs is enough of a pattern to treat as worth closing, not just
+documenting, given how different the fix actually is here.
+
+Unlike `mysql_user` (needs a live database connection, with its own
+credential-chain complications), a permission mode is trivial and safe
+to check live: a single `stat -c %a <path>` over the same SSH connection
+every other check already uses - no new connection type, no
+credentials, no service dependency. Added `_mode_tasks()`/
+`_match_mode_claim()` alongside the existing lineinfile matching -
+`verify-vulnerabilities` now tries a lineinfile match first, then falls
+back to a mode match, before giving up and reporting `NOT VERIFIABLE`.
+Modes are compared as integers (`_normalize_octal_mode()`: `oct(int(mode,
+8))[2:]`) rather than strings, so `'0777'` (a claim's or a task's own
+padded form) and `'777'` (what `stat -c %a` actually prints, and what a
+differently-padded claim might use) compare equal regardless of
+formatting. Verified against the exact real run that came back
+unverifiable: both claims (`0777` on the sudoers file, `04755` on the
+SUID binary) now match their correct tasks.
+
+### An eighth generation bug: a task mis-nested under its own sibling
+
+The unpatched-OpenSSL spec surfaced a new YAML shape none of the
+existing repairs recognized: a task (`Remove the default sources.list.d
+file that triggers auto-updates`) indented two extra spaces, nesting it
+as if it were a child of the *previous* task's mapping body rather than
+the next sibling in the same top-level task list. PyYAML failed
+immediately at that line ("expected <block end>, but found '-'") -
+distinct from every earlier YAML bug (nested quotes, a trailing
+`handlers:` block): here every individual line was valid YAML in
+isolation, just at the wrong indentation relative to its neighbors.
+
+Fixed with `repair_misindented_task()`: dedents the mis-indented line
+and everything after it by the same excess amount, back to the
+top-level list's own indentation. Safe specifically because this
+project's generated roles are always a flat top-level task list - there
+is no legitimately-nested block a real fix could be confused for -
+and `extract_yaml_block()` already normalizes the whole block to start
+at column 0 before this ever runs, so "shift the rest of the document
+left by the excess" is the correct fix here, not just a plausible-looking
+one. Verified against the exact real raw output that failed: all five
+tasks, including the previously mis-nested one, now parse as proper
+top-level siblings.
+
+### The unpatched-OpenSSL class: a genuine corpus gap, confirmed twice - then closed
+
+With the YAML bug out of the way, the unpatched-OpenSSL spec surfaced
+something with no code fix at all: two independent generations both
+produced the *identical* generic role - `Install OpenSSH server` /
+`Ensure sshd is enabled and running`, nothing about packages, versions,
+or updates - with an "Applied misconfigurations" section describing
+tasks that were never actually written. The second attempt's claim text
+was unusually candid about it: `` `ansible.builtin.package` with `name:
+openssl` (not shown in the snippet) `` - the model naming a parameter
+value that appears nowhere in its own generated YAML, and a second claim
+asserting `state: present` alone "ensures no automatic updates are
+applied," which isn't something that parameter does at all.
+
+The cause, on inspection: every other misconfiguration doc in the corpus
+is paired with either a directive-reference doc (`sshd_config/*.md`,
+naming exact settings) or maps onto one well-known Ansible module the
+LLM clearly knows (`mysql_user`, `ufw`, a `mode:` change).
+`misconfigurations/unpatched_outdated_packages.md` has neither - it
+describes the concept ("pinning a package to an old version... never
+applying security updates") but gives no concrete Ansible task pattern
+(there are several plausible real approaches - `apt: name=X=version`,
+disabling the `unattended-upgrades` service, editing
+`/etc/apt/apt.conf.d/20auto-upgrades` - and the corpus commits to none of
+them). Without a pattern to imitate, both generations fell back to
+retrieval's other, unrelated snippets (`ansible_tasks/install_openssh_server.md`
+dominating both times) for the actual task list, while the claims
+section paraphrased the conceptual doc as if it had been applied.
+
+Both attempts producing the exact same failure shape was itself the
+evidence: not a stochastic fluke a third retry would likely clear, but a
+real gap in what the corpus teaches for this vulnerability category
+specifically.
+
+**Closed, not just documented - on the user's own suggestion.** Rather
+than accept this as a permanent limitation, the corpus gap identified
+above was fixed directly: a new
+`knowledge/ansible_tasks/pin_outdated_package.md` doc, giving a concrete,
+real task pattern (`ansible.builtin.dpkg_selections` with `selection:
+hold` to pin a package at its current version; a `lineinfile` task
+setting `APT::Periodic::Unattended-Upgrade "0";` in the real Ubuntu
+config file `unattended-upgrades` actually reads, to disable automatic
+patching) - the same "concrete pattern to imitate" every other
+successful vulnerability class already had. `.chroma/` (the persisted
+vector store) had to be deleted to force a rebuild picking up the new
+doc - a previously-documented, known limitation of this project
+(no cache-invalidation between `knowledge/` and `.chroma/`), now
+actually exercised for the first time rather than just noted.
+
+Re-tested live (well, `provision`-only - no VM boot needed to check
+generation quality): the new doc was retrieved and closely imitated on
+the very first re-roll - real `dpkg_selections` and `lineinfile` tasks,
+matching claims. A second re-roll surfaced one more thing worth fixing:
+the `lineinfile` claim's own phrasing named the directive and its value
+as separate backtick fragments (`` `Unattended-Upgrade` to `"0"` ``)
+rather than the single contiguous line `verify-vulnerabilities` matches
+against - traced to the new doc's *own* prose using that same fragmented
+style, which the LLM evidently imitated right along with the YAML.
+Fixed by rewriting the doc's prose to quote the directive as one
+contiguous span and adding an explicit instruction on the citation
+style expected. A third re-roll confirmed it: the claim now quotes the
+full line verbatim and matches its task correctly. One claim
+(`dpkg_selections`) remains outside current verification scope - a real,
+smaller residual gap (module coverage, not corpus content) of the same
+kind as the database class's `mysql_user` case above, not chased further
+here - but the class as a whole went from zero relevant content to a
+genuinely checkable, attributable claim.
+
+### Both fixed scenarios, retested live: one regex bug, one resilience gap
+
+Running the disabled-logging and (now corpus-fixed) unpatched-OpenSSL
+specs live surfaced two more real, small findings.
+
+**Disabled logging** verified genuinely well: `authpriv.* /dev/null` came
+back `TRUE` and attributed, and the storyline built correctly around it
+(the `auditd|rsyslog|...` category from earlier this week matched as
+designed). The `auditd` claim itself came back `NOT VERIFIABLE` for an
+honest reason worth noting - the claim text was literally the corpus
+doc's own markdown heading (`# Disabled or missing audit logging`),
+which isn't a directive at all; nothing to fix, the mechanism correctly
+found nothing checkable in it.
+
+**Unpatched OpenSSL** verified too - `` `APT::Periodic::Unattended-Upgrade
+"0";` `` came back `TRUE` and attributed, confirming the corpus fix
+above holds under a real boot, not just `provision`-only content
+checks. But the storyline still fell back to the generic entry-vector
+description instead of the "apt"/outdated-package category added
+earlier this week - a real regex bug: the category pattern required
+the *plural* `unattended.?upgrades`, but the actual Ansible/apt
+directive is singular (`Unattended-Upgrade`). Fixed
+(`unattended.?upgrades?`, and added `dpkg_selections` as a second
+matching keyword for the category's other claim type), with a
+regression test against the exact real claim text.
+
+**A recurring cost, finally addressed rather than absorbed each time:**
+the disabled-logging run's *final* boot (verify + export) failed on the
+same Ubuntu-mirror flakiness (DNS resolution failures, separately 404s
+on individual `.deb` files) that had already cost two earlier runs this
+week a full live boot each - three occurrences, never the same failure
+twice, never reproducible by simply retrying the identical generation,
+which is what marks it as mirror flakiness rather than anything this
+project's code causes. Rather than keep absorbing a ~10-15 minute lost
+boot each time it recurred, `apt-get update` and `apt-get install` in
+the base shell provisioner are now each wrapped in a retry loop (3
+attempts, 5 seconds apart, via `until CMD; do ...; done` rather than a
+brace-delimited shell function - deliberately avoiding literal curly
+braces, since the whole provisioner script is a Python `.format()`
+template and an unescaped brace pair breaks it outright, confirmed by
+briefly breaking it with an early draft of this very comment). `set -e`
+still aborts the script - and fails `vagrant up` normally - if a
+failure is real and persistent rather than transient, so this doesn't
+risk masking an actual problem, only smoothing over the kind that's
+already been observed to clear itself within seconds. Verified both the
+bash syntax and the retry logic itself (success-after-retry, and
+correct failure propagation after exhausting attempts) before relying on
+it, given how expensive a live-boot-only test of this would have been.
+
+### Knowledge base: anonymous FTP access developed in after manual testing found it missing
+
+Manual, hands-on verification of the anonymous-FTP-upload scenario (as
+distinct from the automated `verify-vulnerabilities` check, which had
+already marked the claim `TRUE` and attributed) surfaced something the
+automated check alone couldn't: a real `ftp` login to the booted VM was
+rejected with `530 Login incorrect`, even though `/etc/vsftpd.conf`
+genuinely contained `anonymous_enable=YES`, correctly attributed to this
+run's own provisioning. Live diagnosis on the VM (`id ftp` confirming the
+underlying system account and its `/srv/ftp` home both existed;
+`journalctl -u vsftpd` showing `pam_unix` rejecting the login as an
+unrecognized *regular* system account rather than short-circuiting to
+anonymous access; `/etc/pam.d/vsftpd` confirmed as the stock file, whose
+own comment states vsftpd handles anonymous logins itself) traced this to
+a missing step, not a wrong one: the generated role wrote the config
+change but never restarted `vsftpd` afterward, so the daemon kept serving
+the state it was in when `apt install`'s postinst first started it -
+anonymous access disabled. Restarting the service by hand on the live VM,
+with no other change, immediately let the same login through - confirming
+the claimed vulnerability was genuine throughout; the gap was entirely in
+what the generated role did, not in the verification tooling or the
+underlying config.
+
+The knowledge base had nothing to ground this against: no vsftpd content
+of any kind existed in `knowledge/`, so the four snippets retrieved for
+this spec were the nearest available matches on unrelated topics (telnet,
+UFW, default credentials, open firewalls) rather than anything about FTP.
+By contrast, every SSH-based scenario in this evaluation round reliably
+included its own restart step, because `restart_sshd_service.md` and
+`deploy_sshd_config.md` model that pattern explicitly for sshd. Developed
+two new docs into the knowledge base to close this the same way the
+unpatched-package gap was closed above - a concrete pattern to imitate,
+not just a conceptual description: `misconfigurations/anonymous_ftp_upload.md`
+(why anonymous upload access is a real vulnerability, matching the style
+of the existing `unencrypted_telnet_service.md`) and
+`ansible_tasks/configure_vsftpd_anonymous_access.md` (the full task
+sequence - install, edit the config, then an explicit
+`ansible.builtin.service` restart task - with a note on *why* the restart
+task is mandatory, written directly from what this test run showed).
+`.chroma/` was deleted again to force a rebuild, and re-running retrieval
+against the exact same spec confirmed both new docs now come back as the
+top two matches, ahead of the four unrelated snippets the original run
+had to fall back on. This means a fresh checkout of the project - not
+just this one already-patched VM - would ground a future anonymous-FTP
+generation correctly from the start, rather than reproducing the same gap
+this test run found.
+
+
 
 - **FastAPI** — the HTTP interface (`POST /generate`). Chosen over Flask
   for built-in request/response validation via Pydantic models, which

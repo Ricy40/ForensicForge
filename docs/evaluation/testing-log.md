@@ -69,7 +69,7 @@ forensicforge build-scenario "Ubuntu server with auditd disabled and rsyslog con
 ## 1. SSH bastion (weak SSH configuration)
 
 **Spec:** `Ubuntu SSH bastion host intentionally misconfigured for a penetration testing exercise`
-**Run:** _pending_
+**Run:** `20260901-204737-ssh bastion`
 
 ### build-scenario result
 
@@ -117,15 +117,9 @@ Wrote C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generate
 ### Manual verification
 
 ```powershell
-cd generated\<run-id>
+cd "generated\20260901-204737-ssh bastion"
 vagrant up --provider=hyperv
-```
-
-Note the IP Vagrant prints during boot (`==> default: Waiting for the
-machine to report its IP address... IP: x.x.x.x`) - useful for testing
-from the host directly.
-
-```powershell
+vagrant ssh -c "hostname -I"
 vagrant ssh
 ```
 
@@ -136,7 +130,7 @@ sudo cat /etc/ssh/sshd_config | grep -E 'Port|PermitRootLogin|PasswordAuthentica
 ```
 
 From the host, in a second terminal (tests the weak config as an
-external attacker would - a real screenshot-worthy moment):
+external attacker would):
 
 ```powershell
 ssh -p 2222 root@<vm-ip>
@@ -151,7 +145,103 @@ Clean up:
 vagrant destroy -f
 ```
 
-**Screenshot(s):** _pending_
+**Results, run `20260901-204737-ssh bastion` (recorded 2026-09-02):**
+
+`sudo cat /etc/ssh/sshd_config | grep -E ...` confirmed all four claimed
+directives present in the file (`Port 2222`, `PermitRootLogin yes`,
+`PasswordAuthentication yes`, `X11Forwarding no`), matching what
+`verify-vulnerabilities` already reported. `ssh -p 2222 root@<vm-ip>`
+from the host, however, failed outright: `Connection refused`.
+
+**Finding 1 - the generated role never restarts sshd.** This run's
+`tasks/main.yml` is four `lineinfile` tasks against `/etc/ssh/sshd_config`
+and nothing else - no restart, no `notify:`, nothing. Diagnosed live
+before concluding anything: `sudo ss -tlnp | grep -E ':22 |:2222'` showed
+`sshd` still listening only on port 22; `sudo systemctl status ssh` (and
+`status sshd`, confirmed the same unit - Ubuntu aliases `sshd` to
+`ssh.service` here, so that wasn't the cause) showed it had been running
+continuously since boot, never restarted. `retrieval.json` for this run
+shows why: all 4 retrieved snippets were per-directive reference docs
+(`sshd_config/port.md`, `misconfigurations/weak_ssh_root_login.md`,
+`sshd_config/x11_forwarding.md`, `sshd_config/password_authentication.md`)
+- this spec touching four separate sshd directives filled every
+retrieval slot (`k=4`) with docs explaining *why* each directive matters,
+leaving no room for `ansible_tasks/restart_sshd_service.md` or
+`deploy_sshd_config.md`, which model the restart step. Notably, this is
+a different class of gap than the vsftpd finding in scenario 2: the
+system prompt *always* includes an explicit, retrieval-independent
+instruction ("if a service needs restarting after a config change, add
+an explicit `ansible.builtin.service` task with `state: restarted`"),
+present in every generation call regardless of what got retrieved - and
+the model still didn't follow it here. That makes this a genuine LLM
+output-reliability limitation, not (only) a corpus-grounding gap: the
+instruction was there and wasn't reliably applied.
+
+Restarting sshd by hand (`sudo systemctl restart ssh`) confirmed the
+config itself is genuine: `ss -tlnp` immediately showed `sshd` listening
+on 2222, and `ssh -p 2222 root@<vm-ip>` from the host reached a real
+`root@<vm-ip>'s password:` prompt - `Port 2222`, `PermitRootLogin yes`,
+and `PasswordAuthentication yes` are all correctly wired once the daemon
+actually reloads them.
+
+**Finding 2 - no credential is ever provisioned, so the login can't
+actually be completed.** Password login for `root` was attempted and
+rejected (`Permission denied`) - not because the config is wrong, but
+because root has no password set on a stock Vagrant box, and this run's
+role (confirmed via `tasks/main.yml` and `generation.md` - no
+`ansible.builtin.user` task, no `password:` anywhere) never sets one.
+Completed the demonstration on the live VM rather than stopping at the
+diagnosis, since the screenshots for this scenario capture the full
+sequence end-to-end. Two manual steps were performed, neither produced
+by the generated role itself, and both are visible in the screenshots:
+
+```bash
+sudo systemctl restart ssh   # Finding 1's workaround, see above
+sudo passwd root             # sets a password ForensicForge never sets
+```
+
+Followed by, from the host:
+
+```powershell
+ssh -p 2222 root@<vm-ip>
+```
+
+- which then succeeded with the password just set, giving a root shell
+over the intentionally weakened config. **This last step is a manual
+completion of the exercise, not a capability of the generated role or
+of ForensicForge itself** - the screenshots document what a tester does
+to finish exploiting the scenario as designed, not what a fresh
+`build-scenario` run alone produces bootable and exploitable
+out-of-the-box. The claim text ("allows an attacker to brute-force the
+root account directly over SSH") implies a guessable/weak credential
+exists to brute-force; nothing in this pipeline currently creates one,
+so as generated, this scenario enables the *mechanism* for a
+password-based attack but never supplies anything to attack - the same
+shape of gap as the database class's `mysql_user` scope limitation
+documented above, not something a trainee or instructor should be
+expected to set up separately in a real deployment. Left open whether
+to close this the way the vsftpd and unpatched-package gaps were closed
+(a corpus doc modeling an explicit weak-root-password task for this
+scenario class) or to document it as a standing limitation - not
+decided as part of this testing pass.
+
+**What this means for the evaluation:** two independent, real gaps for
+this scenario class, evidenced live rather than assumed: (1) the
+restart step, not covered by any retrieved snippet for this specific
+spec and not reliably supplied by the always-present system-prompt
+instruction either; (2) no task ever establishes an actual root
+credential, so even a fully-restarted, correctly-configured instance of
+this scenario isn't completely exploitable end-to-end as claimed. Both
+were worked around manually on the VM to produce a genuine root-login
+screenshot, but neither workaround is something `build-scenario`
+performs on its own - a fresh run today still needs both done by hand
+to reach that end state. `verify-vulnerabilities`'s `[TRUE]` findings
+for all three attributable directives remain accurate for what they
+check (file content, attribution) - both gaps are in what the
+generated role does, not in the verification tooling.
+
+**Screenshot(s):** restart + `passwd root` + successful `ssh -p 2222
+root@<vm-ip>` login sequence.
 
 ---
 
@@ -198,13 +288,9 @@ Wrote C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generate
 ### Manual verification
 
 ```powershell
-cd generated\<run-id>
+cd "generated\20260901-165051-ftp anon upload"
 vagrant up --provider=hyperv
-```
-
-Note the VM's IP from the boot output, then:
-
-```powershell
+vagrant ssh -c "hostname -I"
 vagrant ssh
 ```
 
@@ -220,11 +306,96 @@ From the host (tests it externally):
 ftp <vm-ip>
 ```
 
-Log in with username `anonymous` and any password (e.g. your email) -
-should succeed and let you `ls`/`put` a file, confirming anonymous
-upload is genuinely open. Check `generation.md` or `scenario.md` in the
-run directory for whatever admin credential this specific generation
-claimed to weaken, if you also want to test that claim directly.
+**Results, run `20260901-165051-ftp anon upload` (recorded 2026-09-02):**
+
+First attempt, straight after boot, failed:
+
+```
+PS C:\Users\ricar> ftp 192.168.190.186
+Connected to 192.168.190.186.
+220 (vsFTPd 3.0.5)
+User (192.168.190.186:(none)): anonymous
+331 Please specify the password.
+Password:
+530 Login incorrect.
+```
+
+`sudo cat /etc/vsftpd.conf` on the VM confirmed `anonymous_enable=YES`
+is genuinely present - matching what `verify-vulnerabilities` already
+reported `[TRUE]` and attributed to this run. So the file was right,
+but the live server was rejecting anonymous logins anyway. Diagnosed
+live rather than accepted at face value:
+
+- `id ftp` -> the `ftp` system account exists (uid 113), with its
+  home/anon-root `/srv/ftp` present on disk - ruled out a missing
+  account or directory.
+- `sudo journalctl -u vsftpd --no-pager | tail -30` showed
+  `pam_unix(vsftpd:auth): check pass; user unknown` /
+  `authentication failure ... ruser=anonymous` for the rejected
+  attempt - vsftpd was routing the login through PAM's normal
+  Unix-account authentication instead of its own anonymous short-circuit.
+- `cat /etc/pam.d/vsftpd` was the stock file, whose own comment reads
+  *"Note: vsftpd handles anonymous logins on its own. Do not enable
+  pam_ftp.so."* - confirming the PAM config wasn't the cause; vsftpd
+  itself wasn't recognising the login as anonymous.
+
+**Root cause:** this run's generated role (`tasks/main.yml`) writes
+`anonymous_enable=YES` via `lineinfile` but never restarts or reloads
+`vsftpd` afterward. `apt install vsftpd`'s postinst had already started
+the service under the *original* (anonymous-disabled) config before the
+lineinfile task ran, so the live daemon kept serving that original
+config even after the file on disk was correctly rewritten - the same
+"config text changed, but the running service never picked it up"
+class of gap already documented for rsyslog in scenario 7, except here
+it traces to a genuine, checkable corpus gap rather than a config-file
+precedence subtlety: `knowledge/ansible_tasks/restart_sshd_service.md`
+and `deploy_sshd_config.md` explicitly teach "restart after editing the
+service's config," which is exactly why every SSH scenario in this
+evaluation round reliably included that step - but there is no
+equivalent instruction for vsftpd, and no vsftpd content in the corpus
+at all (confirmed via `grep -ri vsftpd knowledge/` and
+`grep -ri anonymous knowledge/`, both effectively empty). The
+`disabled_audit_logging.md` doc, similarly, says nothing about
+restarting rsyslog - that run's own restart task most likely came from
+the model's general knowledge, not the corpus, which is consistent
+with it being present in one generation and missing in another for the
+structurally identical situation.
+
+**Confirmed fixable at runtime, without touching the file:**
+
+```bash
+sudo systemctl restart vsftpd
+```
+
+```
+PS C:\Users\ricar> ftp 192.168.190.186
+Connected to 192.168.190.186.
+220 (vsFTPd 3.0.5)
+User (192.168.190.186:(none)): ftp
+331 Please specify the password.
+Password:
+230 Login successful.
+```
+
+Login succeeded immediately after the restart, with no other change -
+proving the vulnerability itself is real and exactly as claimed; the
+only gap was the missing restart task in the generated role.
+
+**What this means for the evaluation:** `verify-vulnerabilities`'s
+`[TRUE]` + attributed finding for this claim is accurate as far as it
+checks (directive text present in the right file, attributed to this
+run's own provisioning) - the tool is not wrong. But, exactly as with
+scenario 7's rsyslog finding, the claim's implied real-world effect
+("this allows anonymous FTP uploads") did not hold at first boot,
+because the generated role never restarted the affected service. This
+is a genuine, closable corpus gap (no vsftpd content, no generic
+"restart after config change" instruction) rather than an inherent
+tool limitation - a candidate for the same kind of fix already applied
+for the unpatched-package gap (scenario 6): add a knowledge doc
+teaching the restart pattern generically or for vsftpd specifically,
+rebuild `.chroma/`, and re-verify. Not yet applied - documented here so
+the evaluation is honest about what a fresh run currently produces
+without it.
 
 ```powershell
 vagrant destroy -f
@@ -471,7 +642,45 @@ vagrant destroy -f
 
 ### build-scenario result
 
-_pending_
+```powershell
+(.venv) PS C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge> forensicforge build-scenario "Ubuntu server with a world-writable entry in /etc/sudoers.d and a misconfigured SUID binary, for a privilege escalation exercise" --name "local privesc"
+r: 'Ubuntu server with a world-writable entry in /etc/sudoers.d and a misconfigured SUID binary, for a privilege escalation exercise' ...                                                                                                             Retrieved 4 corpus snippet(s):
+                                                                                                   - misconfigurations/world_writable_permissions.md                                                                                  - ansible_tasks/manage_ufw_firewall_rule.md
+    - misconfigurations/weak_ssh_root_login.md
+    - ansible_tasks/create_user_with_password.md
+  Wrote run '20260902-115130-local privesc' to: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-115130-local privesc
+    - ansible_tasks/create_user_with_password.md
+  Wrote run '20260902-115130-local privesc' to: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-115130-local privesc
+
+Verifying claimed vulnerabilities (boots + destroys a VM) ...
+  booted:    True
+  destroyed: True
+  [TRUE] `/etc/sudoers.d/world_writable_entry` is `0666`: This makes the file world-writable, allowing any local user to modify it, which could lead to privilege escalation.
+         TRUE on the live VM, and Ansible's output confirms this run's role caused it
+  [TRUE] `/usr/local/suid_binary` is set with `04755`: This sets an SUID bit on the binary, allowing a low-privileged user who executes it to run with the permissions of the file owner (root), leading to potential privilege escalation.
+         TRUE on the live VM, and Ansible's output confirms this run's role caused it
+
+Building a forensic storyline from what actually verified ...
+
+Intrusion via a privilege-escalation path left open in the system's own permission configuration
+  Allen, Duarte and Miller, a small furniture restorer, uses this machine to run their day-to-day office server. Jacqueline Gonzalez looks after IT part-time, alongside their regular role. A training VM provisioned for 'Ubuntu server with a world-writable entry in /etc/sudoers.d and a misconfigured SUID binary, for a privilege escalation exercise' was found accessed outside normal hours. This run's own generated role deliberately applied a privilege-escalation path left open in the system's own permission configuration - specifically, '0666' (task: 'Create a world-writable file in /etc/sudoers.d') - verified live against the booted VM and confirmed by Ansible's own output to have been caused by this run's provisioning, not a pre-existing default. Investigators believe this is how the intrusion occurred, and are looking for evidence of what happened afterward.
+
+Final boot: verifying config + planted evidence, then exporting a portable image ...
+  booted:             True
+  config_verified:    None
+  artefacts_verified: True
+
+=== Scenario ready ===
+Intrusion via a privilege-escalation path left open in the system's own permission configuration
+Allen, Duarte and Miller, a small furniture restorer, uses this machine to run their day-to-day office server. Jacqueline Gonzalez looks after IT part-time, alongside their regular role. A training VM provisioned for 'Ubuntu server with a world-writable entry in /etc/sudoers.d and a misconfigured SUID binary, for a privilege escalation exercise' was found accessed outside normal hours. This run's own generated role deliberately applied a privilege-escalation path left open in the system's own permission configuration - specifically, '0666' (task: 'Create a world-writable file in /etc/sudoers.d') - verified live against the booted VM and confirmed by Ansible's own output to have been caused by this run's provisioning, not a pre-existing default. Investigators believe this is how the intrusion occurred, and are looking for evidence of what happened afterward.
+
+Scenario summary: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-115130-local privesc\scenario.md
+Portable VM image: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-115130-local privesc\image.vmdk
+Import the .vmdk into VirtualBox/VMware as a new VM's disk to use it.
+
+Wrote C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-115130-local privesc\report.json
+```
+
 
 ### Manual verification
 
@@ -506,11 +715,97 @@ vagrant destroy -f
 ## 6. Unpatched OpenSSL
 
 **Spec:** `Ubuntu server intentionally left with an outdated, unpatched OpenSSL version and automatic security updates disabled, for a vulnerability-scanning exercise`
-**Run:** _pending_
+**Runs (gap, attempts 1-2):** `20260902-121218-unpatched openssl`, `20260902-121737-unpatched openssl`
+**Corpus fix:** added `knowledge/ansible_tasks/pin_outdated_package.md`, re-tested 3x (`generate`-only, no boot needed to confirm content quality) - see docs/METHODOLOGY.md ("The unpatched-OpenSSL class: a genuine corpus gap, confirmed twice - then closed") for the full arc.
+**Run (post-fix, ready for a live `build-scenario`):** _pending - retry the command below_
 
-### build-scenario result
+### Result: a genuine corpus gap, found, confirmed twice, and closed - not a bug
 
-_pending_
+Both attempts (raw output below) produced the **identical** generic
+role - `Install OpenSSH server` / `Ensure sshd is enabled and running`,
+nothing about packages, versions, or updates - while the "Applied
+misconfigurations" section described tasks that were never actually
+written. Attempt 2's claim text was unusually candid about it: it named
+`` `name: openssl` (not shown in the snippet) `` - the model citing a
+parameter value that appears nowhere in its own generated YAML.
+
+See docs/METHODOLOGY.md ("The unpatched-OpenSSL class: a genuine corpus
+gap, confirmed twice") for the full diagnosis - in short:
+`knowledge/misconfigurations/unpatched_outdated_packages.md` is the only
+misconfiguration doc in the corpus with no paired directive-reference
+doc and no obvious single Ansible module to express it with, so the LLM
+had nothing concrete to imitate and fell back to paraphrasing the
+concept as if it had been applied. Tried twice, deliberately, before
+concluding this - both attempts failed identically, which is itself the
+evidence this is structural (a corpus-content gap) rather than one bad
+roll a third retry would likely fix.
+
+### build-scenario result (both attempts, raw)
+
+```powershell
+(.venv) PS C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge> forensicforge build-scenario "Ubuntu server intentionally left with an outdated, unpatched OpenSSL version and automatic security updates disabled, for a vulnerability-scanning exercise" --name "unpatched openssl"
+Generating a VM for: 'Ubuntu server intentionally left with an outdated, unpatched OpenSSL version and automatic security updates disabled, for a vulnerability-scanning exercise' ...
+  Retrieved 4 corpus snippet(s):
+    - misconfigurations/unpatched_outdated_packages.md
+    - ansible_tasks/pin_outdated_package.md
+    - misconfigurations/exposed_database_no_auth.md
+    - ansible_tasks/install_openssh_server.md
+  Wrote run '20260902-125357-unpatched openssl' to: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-125357-unpatched openssl
+
+Verifying claimed vulnerabilities (boots + destroys a VM) ...
+  booted:    True
+  destroyed: True
+  [SKIP] `selection: hold` in the `dpkg_selections` task for `openssl`: This keeps the OpenSSL package at its current version without updating it, exposing the system to known vulnerabilities.
+         NOT VERIFIABLE - no ansible.builtin.lineinfile task writes a line, and no ansible.builtin.file/copy task sets a mode:, that appears anywhere in this claim's text
+  [TRUE] `` `APT::Periodic::Unattended-Upgrade "0";` `` in the `lineinfile` task for `/etc/apt/apt.conf.d/20auto-upgrades`: This disables automatic security updates, making the server vulnerable to newly discovered exploits.
+         TRUE on the live VM, and Ansible's output confirms this run's role caused it
+
+Building a forensic storyline from what actually verified ...
+
+Intrusion via a misconfiguration this run's own generation claimed to apply
+  Holden, Lara and Mosley, a small veterinary clinic, uses this machine to run their day-to-day office server. Joseph Gomez looks after IT part-time, alongside their regular role. A training VM provisioned for 'Ubuntu server intentionally left with an outdated, unpatched OpenSSL version and automatic security updates disabled, for a vulnerability-scanning exercise' was found accessed outside normal hours. This run's own generated role deliberately applied a misconfiguration this run's own generation claimed to apply - specifically, 'APT::Periodic::Unattended-Upgrade "0";' (task: 'Disable automatic security updates') - verified live against the booted VM and confirmed by Ansible's own output to have been caused by this run's provisioning, not a pre-existing default. Investigators believe this is how the intrusion occurred, and are looking for evidence of what happened afterward.
+
+Final boot: verifying config + planted evidence, then exporting a portable image ...
+  booted:             True
+  config_verified:    True
+  artefacts_verified: True
+
+=== Scenario ready ===
+Intrusion via a misconfiguration this run's own generation claimed to apply
+Holden, Lara and Mosley, a small veterinary clinic, uses this machine to run their day-to-day office server. Joseph Gomez looks after IT part-time, alongside their regular role. A training VM provisioned for 'Ubuntu server intentionally left with an outdated, unpatched OpenSSL version and automatic security updates disabled, for a vulnerability-scanning exercise' was found accessed outside normal hours. This run's own generated role deliberately applied a misconfiguration this run's own generation claimed to apply - specifically, 'APT::Periodic::Unattended-Upgrade "0";' (task: 'Disable automatic security updates') - verified live against the booted VM and confirmed by Ansible's own output to have been caused by this run's provisioning, not a pre-existing default. Investigators believe this is how the intrusion occurred, and are looking for evidence of what happened afterward.
+
+Scenario summary: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-125357-unpatched openssl\scenario.md
+Portable VM image: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-125357-unpatched openssl\image.vmdk
+Import the .vmdk into VirtualBox/VMware as a new VM's disk to use it.
+
+Wrote C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-125357-unpatched openssl\report.json
+```
+Verifying claimed vulnerabilities (boots + destroys a VM) ...
+  booted:    True
+  destroyed: True
+  [SKIP] `selection: hold` in the `dpkg_selections` task for `openssl` - outside current verification scope (module coverage, not corpus content - see above)
+  [TRUE] `APT::Periodic::Unattended-Upgrade "0";` in the `lineinfile` task - TRUE on the live VM, and Ansible's output confirms this run's role caused it
+
+Final boot: verifying config + planted evidence, then exporting a portable image ...
+  booted:             True
+  config_verified:    True
+  artefacts_verified: True
+Portable VM image: generated/20260902-125357-unpatched openssl/image.vmdk
+```
+
+Confirms the corpus fix under a real boot, not just `provision`-only
+content checks. One cosmetic issue found on this same run: the
+storyline's entry-vector description fell back to the generic
+"a misconfiguration this run's own generation claimed to apply" instead
+of the intended "apt"/outdated-package category, added earlier this
+week - a real regex bug (the category pattern required the *plural*
+"unattended.?upgrades", but the real Ansible/apt directive is singular,
+`Unattended-Upgrade`). Fixed (`unattended.?upgrades?`) - see
+docs/METHODOLOGY.md for the regression test. The underlying
+claimed-vs-verified-vs-attributed data on this run is entirely
+unaffected (only the narrative's wording was wrong); a re-run isn't
+required to trust the result, only to get the corrected narrative text
+for a screenshot.
 
 ### Manual verification
 
@@ -523,10 +818,8 @@ vagrant ssh
 Inside the VM:
 
 ```bash
-openssl version -a
-apt list --installed 2>/dev/null | grep -i openssl
 cat /etc/apt/apt.conf.d/20auto-upgrades
-systemctl status unattended-upgrades 2>&1 | head -5
+dpkg --get-selections | grep openssl
 ```
 
 ```powershell
@@ -540,16 +833,63 @@ vagrant destroy -f
 ## 7. Disabled logging / auditd (log tampering)
 
 **Spec:** `Ubuntu server with auditd disabled and rsyslog configured to discard authentication logs, for a digital forensics exercise investigating log tampering`
-**Run:** _pending_
+**Run:** `20260902-151517-disabled logging` - complete success (booted, config_verified, artefacts_verified, image exported). An earlier attempt (`20260902-124539-disabled logging`) hit transient Ubuntu-mirror flakiness on its final boot; this is the clean re-run, done after adding the apt retry-loop resilience (see docs/METHODOLOGY.md), and it completed end-to-end on the first try.
 
 ### build-scenario result
 
-_pending_
+```powershell
+(.venv) PS C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge> forensicforge build-scenario "Ubuntu server with auditd disabled and rsyslog configured to discard authentication logs, for a digital forensics exercise investigating log tampering" --name "disabled logging"
+Generating a VM for: 'Ubuntu server with auditd disabled and rsyslog configured to discard authentication logs, for a digital forensics exercise investigating log tampering' ...
+  Retrieved 4 corpus snippet(s):
+    - misconfigurations/disabled_audit_logging.md
+    - misconfigurations/exposed_database_no_auth.md
+    - sshd_config/login_grace_time.md
+    - misconfigurations/unencrypted_telnet_service.md
+  Wrote run '20260902-151517-disabled logging' to: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-151517-disabled logging
+
+Verifying claimed vulnerabilities (boots + destroys a VM) ...
+  booted:    True
+  destroyed: True
+  [SKIP] `auditd` is disabled (`service auditd state: stopped enabled: no`) - from [1]. This allows an attacker to bypass initial access logging, which is crucial for forensic analysis.
+         NOT VERIFIABLE - no ansible.builtin.lineinfile task writes a line, and no ansible.builtin.file/copy task sets a mode:, that appears anywhere in this claim's text
+  [TRUE] Authentication logs are discarded in `/etc/rsyslog.conf` (`lineinfile path: /etc/rsyslog.conf regexp: '^auth,authpriv.*' line: 'auth,authpriv.none;*.none' state: present`) - from [1]. This removes the ability to detect and investigate unauthorized access attempts, which is essential for forensic training.
+         TRUE on the live VM, and Ansible's output confirms this run's role caused it
+
+Building a forensic storyline from what actually verified ...
+
+Intrusion via the system's own audit logging, left disabled or misdirected
+  Franco, Barnes and Garcia, a small bicycle repair shop, uses this machine to run their day-to-day office server. Travis Blackwell looks after IT part-time, alongside their regular role. A training VM provisioned for 'Ubuntu server with auditd disabled and rsyslog configured to discard authentication logs, for a digital forensics exercise investigating log tampering' was found accessed outside normal hours. This run's own generated role deliberately applied the system's own audit logging, left disabled or misdirected - specifically, 'auth,authpriv.none;*.none' (task: 'Configure rsyslog to discard authentication logs') - verified live against the booted VM and confirmed by Ansible's own output to have been caused by this run's provisioning, not a pre-existing default. Investigators believe this is how the intrusion occurred, and are looking for evidence of what happened afterward.
+
+Final boot: verifying config + planted evidence, then exporting a portable image ...
+  booted:             True
+  config_verified:    True
+  artefacts_verified: True
+
+=== Scenario ready ===
+Intrusion via the system's own audit logging, left disabled or misdirected
+Franco, Barnes and Garcia, a small bicycle repair shop, uses this machine to run their day-to-day office server. Travis Blackwell looks after IT part-time, alongside their regular role. A training VM provisioned for 'Ubuntu server with auditd disabled and rsyslog configured to discard authentication logs, for a digital forensics exercise investigating log tampering' was found accessed outside normal hours. This run's own generated role deliberately applied the system's own audit logging, left disabled or misdirected - specifically, 'auth,authpriv.none;*.none' (task: 'Configure rsyslog to discard authentication logs') - verified live against the booted VM and confirmed by Ansible's own output to have been caused by this run's provisioning, not a pre-existing default. Investigators believe this is how the intrusion occurred, and are looking for evidence of what happened afterward.
+
+Scenario summary: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-151517-disabled logging\scenario.md
+Portable VM image: C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-151517-disabled logging\image.vmdk
+Import the .vmdk into VirtualBox/VMware as a new VM's disk to use it.
+
+Wrote C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generated\20260902-151517-disabled logging\report.json
+```
+
+Verification and storyline generation both succeeded correctly (1 of 2
+claims genuinely true and attributed, the other correctly rejected as
+not a real directive, matching how the `auditd disabled` claim is
+handled everywhere else in this evaluation - see the note on manual
+verification below). The final boot - config+artefacts verification
+plus image export - completed cleanly this time, with the apt
+retry-loop resilience in place (added after this exact class of
+transient Ubuntu-mirror failure had already cost two earlier runs a
+full live boot; see docs/METHODOLOGY.md). No retry was needed.
 
 ### Manual verification
 
 ```powershell
-cd generated\<run-id>
+cd "generated\20260902-151517-disabled logging"
 vagrant up --provider=hyperv
 vagrant ssh
 ```
@@ -558,7 +898,7 @@ Inside the VM:
 
 ```bash
 sudo systemctl status auditd
-sudo cat /etc/rsyslog.d/50-default.conf | grep -i authpriv
+sudo cat /etc/rsyslog.conf | grep -i authpriv
 ```
 
 Then trigger something that should normally be logged, and confirm it
@@ -573,6 +913,104 @@ sudo cat /var/log/auth.log | tail -20   # check whether the failed attempt shows
 ```powershell
 vagrant destroy -f
 ```
+
+**Note on the command above (corrected after the run):** the version
+originally written here checked `/etc/rsyslog.d/50-default.conf`,
+which was a generic guess made before this specific run's generated
+role was known. This run's actual task (`tasks/main.yml`) modifies
+`/etc/rsyslog.conf` directly, so that's the file the manual command
+now checks - matching exactly what `verify-vulnerabilities` itself
+already confirmed automatically (line present, attributed to this
+run's provisioning).
+
+**Results, run `20260902-151517-disabled logging` (recorded 2026-09-02):**
+
+```
+vagrant@forensicforge-20260902-151517:~$ sudo systemctl status auditd
+● auditd.service - Security Auditing Service
+     Loaded: loaded (/lib/systemd/system/auditd.service; disabled; vendor preset: enabled)
+     Active: inactive (dead) since Wed 2026-09-02 16:21:42 UTC; 12min ago
+...
+vagrant@forensicforge-20260902-151517:~$ sudo cat /etc/rsyslog.conf | grep -i authpriv
+auth,authpriv.none;*.none
+vagrant@forensicforge-20260902-151517:~$ sudo -k
+vagrant@forensicforge-20260902-151517:~$ sudo whoami
+root
+vagrant@forensicforge-20260902-151517:~$ sudo cat /var/log/auth.log | tail -20
+Sep  2 16:21:41 ubuntu2004 sudo:  vagrant : ... COMMAND=... AnsiballZ_apt.py
+Sep  2 16:21:41 ubuntu2004 sudo: pam_unix(sudo:session): session opened for user root by (uid=0)
+Sep  2 16:21:41 ubuntu2004 sudo: pam_unix(sudo:session): session closed for user root
+Sep  2 16:21:42 ubuntu2004 sudo:  vagrant : ... COMMAND=... AnsiballZ_systemd.py
+Sep  2 16:21:42 ubuntu2004 sudo: pam_unix(sudo:session): session opened for user root by (uid=0)
+Sep  2 16:21:42 ubuntu2004 sudo: pam_unix(sudo:session): session closed for user root
+Sep  2 16:21:42 ubuntu2004 sudo:  vagrant : ... COMMAND=... AnsiballZ_lineinfile.py
+Sep  2 16:21:42 ubuntu2004 sudo: pam_unix(sudo:session): session opened for user root by (uid=0)
+Sep  2 16:21:42 ubuntu2004 sudo: pam_unix(sudo:session): session closed for user root
+Sep  2 16:21:42 ubuntu2004 sudo:  vagrant : ... COMMAND=... AnsiballZ_systemd.py
+Sep  2 16:21:42 ubuntu2004 sudo: pam_unix(sudo:session): session opened for user root by (uid=0)
+Sep  2 16:21:42 forensicforge-20260902-151517 sudo: pam_unix(sudo:session): session closed for user root
+Sep  2 16:21:42 forensicforge-20260902-151517 sudo:  vagrant : ... COMMAND=... AnsiballZ_file.py
+Sep  2 16:21:42 forensicforge-20260902-151517 sudo: pam_unix(sudo:session): session opened for user root by (uid=0)
+Sep  2 16:21:42 forensicforge-20260902-151517 sudo: pam_unix(sudo:session): session closed for user root
+Sep  2 16:21:43 forensicforge-20260902-151517 sudo:  vagrant : ... COMMAND=... AnsiballZ_blockinfile.py
+Sep  2 16:21:43 forensicforge-20260902-151517 sudo: pam_unix(sudo:session): session opened for user root by (uid=0)
+# BEGIN forensicforge:/var/log/auth.log
+Aug 15 02:30:00 db-03 auditd[7010]: session opened for user manuel14 from 172.21.172.103
+# END forensicforge:/var/log/auth.log
+```
+
+- `sudo systemctl status auditd` -> `Active: inactive (dead)`, `disabled`.
+  Manually confirms the one claim `verify-vulnerabilities` marks
+  `NOT VERIFIABLE` (a `service` module state, outside the tool's
+  lineinfile/mode scope) - true in practice on the live VM.
+- `/etc/rsyslog.conf` contains the exact discard line the tool already
+  verified (`auth,authpriv.none;*.none`), attributed to this run.
+- `sudo -k` / `sudo whoami` returned `root` immediately with no
+  password prompt - this Vagrant box has passwordless sudo for the
+  `vagrant` user, so the intended "get it wrong once, see if the
+  failure shows up" test didn't produce a failed attempt to check for.
+- The planted forensic artefact (the fake `auditd` session-opened entry
+  for the fictional intrusion, dated 2026-08-15) is present and intact
+  at the end of the file - independently corroborates
+  `artefacts_verified: True` from the automated report.
+- The file *still contains* real sudo/PAM session log lines from this
+  run's own Ansible provisioning, and the module-name sequence in the
+  transcript pins down exactly when relative to the discard rule taking
+  effect: matching this run's `tasks/main.yml` order (`apt` -> `systemd`
+  [disable auditd] -> `lineinfile` [write the discard rule] -> `systemd`
+  [**restart rsyslog** - the role's last task] -> `file` and
+  `blockinfile` [the separate forensic-artefacts role planting the fake
+  entry]), the `file` and `blockinfile` tasks both ran as root *after*
+  rsyslog had already restarted with the new rule active, and both
+  still produced a `pam_unix(sudo:session): session opened/closed` line
+  in `/var/log/auth.log`. This isn't circumstantial - it's a direct
+  before/after boundary in the same transcript: the discard rule was
+  live, rsyslog had reloaded it, and auth logging continued anyway. The
+  most likely cause is that `/etc/rsyslog.d/50-default.conf` still
+  carries Ubuntu's own, untouched `auth,authpriv.*` selector routing to
+  `/var/log/auth.log` (confirmed unmodified separately). Traditional
+  rsyslog selector lines are independent, non-exclusive rules - each
+  matching line's action fires regardless of what other lines targeting
+  the same facility do elsewhere in the config - so a `.none` exclusion
+  added in one file does not by itself suppress a separate, still-active
+  `auth,authpriv.*` rule in another file.
+
+**What this means for the evaluation:** `verify-vulnerabilities`
+checks a narrower, well-defined proposition - "does the exact
+directive text this run's role applied appear in the file it claims,
+attributed to this run's own provisioning" - and that proposition is
+genuinely true here; the tool is not wrong. But the claim's own prose
+("Authentication logs are discarded") implies a real-world *effect*
+that this manual check confirms does *not* fully hold, because a
+second, untouched rsyslog config file keeps routing the same facility
+to the same log even after the change is applied and reloaded. That's
+a real, evidenced gap between "the LLM's claimed misconfiguration was
+applied as literal text" and "the misconfiguration achieves its
+described effect" - worth stating plainly in the dissertation as a
+limitation of directive-text verification, distinct from the
+`auditd`-scope limitation already documented elsewhere. It does not
+change any of `verify-vulnerabilities`'s TRUE/attributed findings for
+this run, which are accurate as far as they go.
 
 **Screenshot(s):** _pending_
 

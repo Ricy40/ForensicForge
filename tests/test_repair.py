@@ -4,6 +4,7 @@ from forensicforge.provision.ansible_writer import write_ansible_role
 from forensicforge.provision.repair import (
     repair_dangling_notify,
     repair_lineinfile_backreferences,
+    repair_misindented_task,
     repair_trailing_handlers_block,
     repair_user_module_path_misuse,
     repair_yaml_text,
@@ -315,3 +316,58 @@ def test_write_ansible_role_recovers_from_real_multi_bug_generation(tmp_path):
     tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
     assert len(tasks) == 2
     assert all("notify" not in t for t in tasks)
+
+
+# --- repair_misindented_task: a task nested as a child of its previous sibling ---
+
+MISINDENTED_TASK_YAML = """\
+- name: Set OpenSSL to a known vulnerable version (deliberate misconfiguration)
+  ansible.builtin.package:
+    name: openssl
+    state: present
+    version: "1.0.2g"
+
+- name: Disable automatic security updates (deliberate misconfiguration)
+  ansible.builtin.package_facts:
+    manager: apt
+
+  - name: Remove the default sources.list.d file that triggers auto-updates
+    ansible.builtin.file:
+      path: /etc/apt/sources.list.d/unattended-upgrades.list
+      state: absent
+"""
+
+
+def test_repair_misindented_task_dedents_to_top_level():
+    try:
+        yaml.safe_load(MISINDENTED_TASK_YAML)
+        assert False, "fixture should reproduce the real parse failure"
+    except yaml.YAMLError as exc:
+        repaired_text, note = repair_misindented_task(MISINDENTED_TASK_YAML, exc)
+
+    assert repaired_text is not None
+    tasks = yaml.safe_load(repaired_text)
+    assert len(tasks) == 3
+    assert tasks[2]["name"] == "Remove the default sources.list.d file that triggers auto-updates"
+    assert tasks[2]["ansible.builtin.file"]["state"] == "absent"
+
+
+def test_write_ansible_role_recovers_from_real_misindented_task_bug(tmp_path):
+    """Regression test against the exact real failure: a task indented as
+    a child of its previous sibling instead of the next item in the same
+    top-level list - PyYAML failed with "expected <block end>, but found
+    '-'" pointing right at the mis-indented line."""
+    raw_output = (
+        "1. ```yaml\n"
+        f"{MISINDENTED_TASK_YAML}"
+        "```\n\n**Applied misconfigurations**:\n"
+        "   - `version: \"1.0.2g\"` - an outdated, known-vulnerable OpenSSL version.\n"
+    )
+
+    role_dir, repairs = write_ansible_role(raw_output, tmp_path / "run")
+
+    assert len(repairs) == 1
+    assert "dedented" in repairs[0]
+    tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
+    assert len(tasks) == 3
+    assert tasks[2]["name"] == "Remove the default sources.list.d file that triggers auto-updates"

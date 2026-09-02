@@ -98,6 +98,74 @@ def _lineinfile_tasks(role_dir: Path) -> list[dict]:
     return [t for t in tasks if isinstance(t.get("ansible.builtin.lineinfile"), dict)]
 
 
+# ansible.builtin.file (path:) and ansible.builtin.copy (dest:) both take a
+# mode: permission string - a second, distinct kind of individually-
+# checkable claim alongside lineinfile's, added after two of seven
+# real evaluation-round specs (privilege escalation, SUID/sudoers
+# world-writable permissions) came back entirely unverifiable: every
+# claim they produced was a mode: value, none a lineinfile line, so the
+# lineinfile-only mechanism found nothing checkable in either run at all.
+# Unlike the mysql_user case (also lineinfile-only-unverifiable, see
+# docs/METHODOLOGY.md's database-class section) a permission mode is
+# safe and simple to check live - a single `stat`, no live service
+# connection or credential-chain complexity - so this was worth adding
+# rather than recording as another limitation.
+_MODE_MODULES = ("ansible.builtin.file", "ansible.builtin.copy")
+
+
+def _mode_tasks(role_dir: Path) -> list[dict]:
+    tasks_file = role_dir / "tasks" / "main.yml"
+    tasks = yaml.safe_load(tasks_file.read_text(encoding="utf-8")) or []
+    result = []
+    for task in tasks:
+        for module in _MODE_MODULES:
+            args = task.get(module)
+            if isinstance(args, dict) and "mode" in args and (args.get("path") or args.get("dest")):
+                result.append(task)
+                break
+    return result
+
+
+def _task_mode_and_path(task: dict) -> tuple[str, str] | None:
+    for module in _MODE_MODULES:
+        args = task.get(module)
+        if isinstance(args, dict) and "mode" in args:
+            path = args.get("path") or args.get("dest")
+            if path:
+                return str(args["mode"]), str(path)
+    return None
+
+
+def _normalize_octal_mode(mode: str) -> str | None:
+    """'0777' / '04755' -> '777' / '4755' - the exact form `stat -c %a`
+    prints (no leading zero; special bits collapse naturally when
+    present). Comparing as an integer rather than a string sidesteps
+    every padding variant a claim or a task might use."""
+    try:
+        return oct(int(str(mode), 8))[2:]
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_mode_claim(claim: ClaimedVulnerability, mode_tasks: list[dict]) -> tuple[dict | None, str | None]:
+    """Find the file/copy task (if any) a claim's permission mode refers
+    to - the same "does the claim's own text contain what the task
+    actually did" principle as _match_claim(), just against a mode value
+    instead of a lineinfile line. Tried against both the task's raw mode
+    string (e.g. '04755') and its normalized form ('4755'), since a claim
+    might quote either.
+    """
+    for task in mode_tasks:
+        result = _task_mode_and_path(task)
+        if result is None:
+            continue
+        mode, _path = result
+        normalized = _normalize_octal_mode(mode)
+        if mode in claim.text or (normalized and normalized in claim.text):
+            return task, mode
+    return None, None
+
+
 def _match_claim(claim: ClaimedVulnerability, lineinfile_tasks: list[dict]) -> tuple[dict | None, str | None]:
     """Find the lineinfile task (if any) a claim refers to.
 
@@ -156,6 +224,7 @@ def verify_vulnerabilities(run_dir: Path, role_dir: Path) -> VulnerabilityReport
     raw_output = generation_path.read_text(encoding="utf-8")
     claims = parse_applied_misconfigurations(raw_output)
     lineinfile_tasks = _lineinfile_tasks(role_dir)
+    mode_tasks = _mode_tasks(role_dir)
 
     findings: list[VulnerabilityFinding] = []
     checks: list[DerivedCheck] = []
@@ -163,34 +232,52 @@ def verify_vulnerabilities(run_dir: Path, role_dir: Path) -> VulnerabilityReport
 
     for claim in claims:
         task, directive = _match_claim(claim, lineinfile_tasks)
-        if task is None:
-            reason = (
-                "no ansible.builtin.lineinfile task in the generated role writes a line "
-                "that appears anywhere in this claim's text"
+        if task is not None:
+            task_name = str(task.get("name", ""))
+            module_args = task["ansible.builtin.lineinfile"]
+            path = module_args.get("path")
+            line = str(module_args.get("line", ""))
+            escaped = line.replace("'", "'\\''")
+            check = DerivedCheck(
+                command=f"sudo grep -F -- '{escaped}' {path}",
+                expected=line,
+                task_name=task_name,
+                category="vulnerability",
             )
-            findings.append(VulnerabilityFinding(
-                claim=claim.text,
-                directive=claim.directives[0] if claim.directives else None,
-                verifiable=False,
-                note=f"NOT VERIFIABLE - {reason}",
-            ))
+            checks.append(check)
+            finding = VulnerabilityFinding(claim=claim.text, directive=directive, verifiable=True, task_name=task_name)
+            check_by_task_name[task_name] = finding
+            findings.append(finding)
             continue
 
-        task_name = str(task.get("name", ""))
-        module_args = task["ansible.builtin.lineinfile"]
-        path = module_args.get("path")
-        line = str(module_args.get("line", ""))
-        escaped = line.replace("'", "'\\''")
-        check = DerivedCheck(
-            command=f"sudo grep -F -- '{escaped}' {path}",
-            expected=line,
-            task_name=task_name,
-            category="vulnerability",
+        mode_task, mode = _match_mode_claim(claim, mode_tasks)
+        if mode_task is not None:
+            task_name = str(mode_task.get("name", ""))
+            _, path = _task_mode_and_path(mode_task)
+            normalized = _normalize_octal_mode(mode)
+            check = DerivedCheck(
+                command=f"sudo stat -c %a {path}",
+                expected=normalized,
+                task_name=task_name,
+                category="vulnerability",
+            )
+            checks.append(check)
+            finding = VulnerabilityFinding(claim=claim.text, directive=mode, verifiable=True, task_name=task_name)
+            check_by_task_name[task_name] = finding
+            findings.append(finding)
+            continue
+
+        reason = (
+            "no ansible.builtin.lineinfile task writes a line, and no "
+            "ansible.builtin.file/copy task sets a mode:, that appears anywhere in "
+            "this claim's text"
         )
-        checks.append(check)
-        finding = VulnerabilityFinding(claim=claim.text, directive=directive, verifiable=True, task_name=task_name)
-        check_by_task_name[task_name] = finding
-        findings.append(finding)
+        findings.append(VulnerabilityFinding(
+            claim=claim.text,
+            directive=claim.directives[0] if claim.directives else None,
+            verifiable=False,
+            note=f"NOT VERIFIABLE - {reason}",
+        ))
 
     if not checks:
         return VulnerabilityReport(

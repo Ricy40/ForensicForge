@@ -111,7 +111,33 @@ Vagrant.configure("2") do |config|
   # any future database spec, MySQL or Postgres - cheap (a few MB) to
   # install preemptively versus detecting per-role which driver a
   # specific run's tasks would need.
-  config.vm.provision "shell", inline: "mkdir -p {provisioning_path} && rm -rf {provisioning_path}/roles && sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip python3-pymysql python3-psycopg2 && sudo pip3 install --quiet ansible", privileged: false
+  # apt-get update/install are each wrapped in a retry loop (3 attempts,
+  # 5s apart) - Ubuntu's own mirrors (us.archive.ubuntu.com,
+  # security.ubuntu.com) have failed transiently multiple times this
+  # project, independently, on different runs and different specs
+  # (DNS resolution failures, and separately 404s on individual .deb
+  # files) - never the same failure twice, never reproducible by
+  # retrying the exact same generation, which is what marks it as
+  # mirror flakiness rather than anything this project's code causes.
+  # Costed a full ~10-15 minute live boot each time it wasn't caught
+  # before now. `until CMD; do ...; done` (not a shell function with a
+  # brace-delimited body) deliberately avoids literal curly-brace
+  # characters - this whole block is a Python .format() template, and a
+  # brace pair needing escaping is easy to get subtly wrong (confirmed:
+  # an earlier draft of this exact comment, quoting a brace-delimited
+  # shell function for illustration, broke .format() itself - the
+  # literal braces in a *comment* still count). `set -e` ensures a real,
+  # persistent failure (not just a transient one the retries clear)
+  # still aborts the script and fails `vagrant up`
+  # normally, rather than the retry logic silently swallowing it.
+  config.vm.provision "shell", privileged: false, inline: <<~SCRIPT
+    set -e
+    mkdir -p {provisioning_path}
+    rm -rf {provisioning_path}/roles
+    n=0; until sudo apt-get update -qq; do n=$((n+1)); if [ $n -ge 3 ]; then exit 1; fi; sleep 5; done
+    n=0; until sudo apt-get install -y -qq python3-pip python3-pymysql python3-psycopg2; do n=$((n+1)); if [ $n -ge 3 ]; then exit 1; fi; sleep 5; done
+    sudo pip3 install --quiet ansible
+  SCRIPT
   config.vm.provision "file", source: "playbook.yml", destination: "{provisioning_path}/playbook.yml"
   config.vm.provision "file", source: "roles", destination: "{provisioning_path}/roles"
 
