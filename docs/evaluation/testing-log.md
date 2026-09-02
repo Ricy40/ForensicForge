@@ -408,7 +408,7 @@ vagrant destroy -f
 ## 3. Web application misconfiguration
 
 **Spec:** `Ubuntu web server running Apache with directory listing enabled, a default-credential admin panel, and verbose error pages exposing stack traces, for a web application security exercise`
-**Run:** _pending_
+**Run:** `20260901-175454-web app misconfig`
 
 ### build-scenario result
 
@@ -451,23 +451,9 @@ Wrote C:\Users\ricar\Documents\Programming\PythonProjects\ForensicForge\generate
 ### Manual verification
 
 ```powershell
-cd generated\<run-id>
+cd "generated\20260901-175454-web app misconfig"
 vagrant up --provider=hyperv
-```
-
-Note the VM's IP, then open it directly in a browser on the host -
-`http://<vm-ip>/` - the most screenshot-friendly of the seven:
-
-- Directory listing: browse to a path with no `index.html` and confirm
-  Apache lists the directory contents.
-- Default-credential admin panel: check `scenario.md`/`generation.md` in
-  the run directory for whatever path/credential this generation
-  actually claimed (varies per run), then log in with it.
-- Verbose error pages: request a path likely to 404/500 and check
-  whether the response includes a stack trace or internal path
-  disclosure rather than a generic error page.
-
-```powershell
+vagrant ssh -c "hostname -I"
 vagrant ssh
 ```
 
@@ -476,11 +462,97 @@ sudo apache2ctl -S
 sudo cat /etc/apache2/apache2.conf | grep -i indexes
 ```
 
+From the host, open `http://<vm-ip>/` in a browser.
+
 ```powershell
 vagrant destroy -f
 ```
 
-**Screenshot(s):** _pending_
+**Results, run `20260901-175454-web app misconfig` (recorded 2026-09-02):**
+
+Three distinct findings, none of them Vagrant/network issues - all
+traced to what this run's role actually did or didn't do:
+
+**Finding 1 - connecting to the wrong address first.** Initial attempts
+to reach `http://192.168.181.26/` (a transposed digit - the VM's real
+address, from `ip -4 addr show`, was `192.168.181.16`) and to
+`127.0.2.1` (Apache's own locally-resolved loopback address *inside*
+the VM, from the `AH00558 Could not reliably determine the server's
+fully qualified domain name` warning - never reachable from the host,
+expected) both failed for mundane reasons unrelated to the scenario.
+`http://192.168.181.16/` loaded the default Apache "It works" page
+immediately once corrected.
+
+**Finding 2 - the "admin panel with default credentials" claim
+describes something that was never built.** `/admin.html` (the actual
+path the `copy` task writes to - not `/admin`, which 404s) loads fine
+and shows the login form. Submitting `admin`/`admin` (the credential
+`scenario.md` names) returns a plain Apache `Not Found` for `/login`,
+regardless of what's entered. Checked the raw generation
+(`generation.md`) and the applied role (`tasks/main.yml`): the entire
+role is `ansible.builtin.package` (install), `ansible.builtin.service`
+(start), two `lineinfile` edits, and one `ansible.builtin.copy` writing
+a static HTML file - no PHP, CGI, WSGI, or any other backend is
+installed or configured anywhere. `/login` was never going to resolve
+to anything; Apache is only ever serving static files here. This is a
+different, more severe shape of gap than the SSH scenario's missing
+root password: there, the login *mechanism* was real and only lacked a
+credential; here, the claimed mechanism (a working login checking
+`admin`/`admin`) does not exist at all, static decoy page aside. No
+restart, reload, or manual credential-setting can fix this - the
+finding is that the claim over-describes what a static HTML form
+actually is.
+
+**Finding 3 - the one claim that is real was masked by an artefact the
+role never removes.** `Options Indexes FollowSymLinks` genuinely is
+written and (after this run's now-familiar missing-reload gap - see
+scenario 2/1's findings; `sudo systemctl reload apache2` was required
+before it took effect) genuinely does work, but browsing to `/`
+continued to show the stock "It works" page even after the reload,
+because Apache's `DirectoryIndex index.html` directive takes priority
+over `Options Indexes` whenever an index file is present - and the
+stock Ubuntu default `index.html` is still sitting in
+`/var/www/html/` alongside `admin.html` (confirmed via `ls -la
+/var/www/html/`: both files present, nothing else). The role never
+removes or replaces it. Verified the directive genuinely works by
+creating an empty subdirectory (`sudo mkdir /var/www/html/test`) and
+browsing to `http://192.168.181.16/test/` - a real Apache-generated
+directory listing (`Index of /test`, `Apache/2.4.41 (Ubuntu) Server at
+192.168.181.16 Port 80`) rendered correctly. So the directive is real
+and attributable, exactly as `verify-vulnerabilities` reports - it's
+just not observable at the one path (`/`) a trainee would naturally
+check first, because the role leaves the default landing page in
+place.
+
+**A fourth, related detail worth recording:** the *raw* LLM generation
+for this run actually included `notify: restart apache2` on both the
+`copy` and the second `lineinfile` task (visible in `generation.md`) -
+this project's repair step correctly stripped both (`Auto-repaired 2
+known issue(s)`, logged in the `build-scenario` output above), since no
+handlers file exists for `notify:` to reference. But because neither
+task also had an explicit fallback restart task, stripping the
+`notify:` left this run with no restart mechanism at all - directly
+confirming the stale-corpus-pattern risk flagged after the FTP fix
+(scenario 2): `restart_sshd_service.md`/`deploy_sshd_config.md` still
+model the now-forbidden `notify:` pattern, and this is a live instance
+of that pattern actually causing the missing-reload gap, not just a
+theoretical risk.
+
+**What this means for the evaluation:** `verify-vulnerabilities`'s one
+`[TRUE]` finding for this run is accurate and, once manually reloaded,
+demonstrably correct. Its one `[SKIP]` (`NOT VERIFIABLE`) finding is
+also correctly cautious - and manual testing here confirms *why* it
+couldn't be verified automatically was the right call, not an
+undershoot: the claim describes a login mechanism that plainly doesn't
+exist. This scenario surfaced the same missing-reload pattern as
+scenarios 1 and 2, plus two new findings specific to this vulnerability
+class (an over-described static-page claim, and a real finding masked
+by an un-cleared default artefact) - all in what the generated role
+does, not in the verification tooling.
+
+**Screenshot(s):** corrected-IP Apache landing page; `/admin.html` form
+submission returning `Not Found`; `/test/` directory listing after
+manual reload.
 
 ---
 
