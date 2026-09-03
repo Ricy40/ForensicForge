@@ -56,7 +56,7 @@ src/forensicforge/
         wsl_bridge.py         Runs POSIX-only tools via WSL on Windows
         report.py             Builds/aggregates report.json across runs
     config.py               Ollama/RAG/provisioning/validation settings
-    prompts.py              Prompt templates (RAG and week-1 ungrounded)
+    prompts.py              Prompt templates (RAG)
     service.py              Shared generate_vm_spec() used by API and CLI
     api.py                  FastAPI app (POST /generate)
     cli.py                  click CLI: generate/provision/validate/test-deploy/...
@@ -74,11 +74,6 @@ tests/
     validate.yml             CI: static scans + Molecule (Docker driver), no boot
 generated/                  Output of `provision` runs (gitignored), one dir per run-id
 ```
-
-Design rationale (the `src/` layout, the `LLMBackend` ABC, the vector
-store/embedding model choice, the parsing approach, the Packer/stock-box
-decision, and this week's scanning/Molecule/CI design) is written up in
-[`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) rather than duplicated here.
 
 ## 1. Install dependencies
 
@@ -151,7 +146,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/generate -Method Post -ContentType 
 The response is `{"output": "...", "snippets": [{"source": "...", "content": "..."}]}` -
 `snippets` lists the corpus documents retrieved for that request, so it's
 traceable which piece of grounding influenced the output. Pass
-`"use_rag": false` in the request body to get the week-1 ungrounded prompt
+`"use_rag": false` in the request body to get the ungrounded prompt
 instead (no retrieval, `snippets` comes back empty) - useful for comparing
 grounded vs ungrounded output. The API doesn't expose `provision`/
 `validate`/`test-deploy` yet - those are CLI-only.
@@ -159,9 +154,9 @@ grounded vs ungrounded output. The API doesn't expose `provision`/
 ## 4. Run the CLI
 
 ```bash
-# print raw generated output (like week 1/2)
+# print raw generated output
 forensicforge generate "Ubuntu server VM with a deliberately weak SSH config for a pentesting exercise"
-forensicforge generate --no-rag "..."   # week-1 ungrounded prompt instead
+forensicforge generate --no-rag "..."   # ungrounded prompt instead
 
 # parse that output into a real Ansible role + Vagrantfile + Molecule scenario
 forensicforge provision "Ubuntu server VM with a deliberately weak SSH config for a pentesting exercise"
@@ -200,8 +195,7 @@ forensicforge test-deploy generated/<run-id>
 ```
 
 Boots the VM, greps the config each `lineinfile` task claims to have
-applied out of the file it claims to have applied it to (mirroring the
-manual week-3 check), then always destroys the VM afterward - even if a
+applied out of the file it claims to have applied it to, then always destroys the VM afterward - even if a
 check fails. Needs an elevated terminal on this machine (Hyper-V provider
 requirement).
 
