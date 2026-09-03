@@ -3,6 +3,7 @@ import yaml
 from forensicforge.provision.ansible_writer import write_ansible_role
 from forensicforge.provision.repair import (
     repair_dangling_notify,
+    repair_escaped_newlines_in_script_content,
     repair_lineinfile_backreferences,
     repair_misindented_task,
     repair_trailing_handlers_block,
@@ -371,3 +372,77 @@ def test_write_ansible_role_recovers_from_real_misindented_task_bug(tmp_path):
     tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
     assert len(tasks) == 3
     assert tasks[2]["name"] == "Remove the default sources.list.d file that triggers auto-updates"
+
+
+# --- repair_escaped_newlines_in_script_content: a flattened shebang script ---
+
+# The exact real shape (local-privesc, week 7): a single-quoted YAML scalar
+# with `\n` escapes, which single-quoted YAML never interprets - every
+# `\n` here is two literal characters, not a line break, so the "shebang"
+# line the LLM intended is actually the whole garbled string. Confirmed
+# live: the SUID mode applied and verified fine, but executing the file
+# returned "not found" (an unresolvable interpreter), and `cat -A` showed
+# the entire file as one line ending in a single `$`.
+SUID_ESCAPED_NEWLINE_YAML = """\
+- name: Set an SUID binary to demonstrate privilege escalation
+  ansible.builtin.copy:
+    content: '#!/usr/bin/python3\\nimport os\\necho "SUID Binary Executed"\\nos.system("/bin/sh")'
+    dest: /usr/local/suid_binary
+    mode: '04755'
+"""
+
+
+def test_repair_escaped_newlines_in_script_content_fixes_flattened_shebang_script():
+    tasks = yaml.safe_load(SUID_ESCAPED_NEWLINE_YAML)
+
+    repaired, notes = repair_escaped_newlines_in_script_content(tasks)
+
+    assert len(notes) == 1
+    content = repaired[0]["ansible.builtin.copy"]["content"]
+    assert "\\n" not in content
+    assert content.splitlines() == [
+        "#!/usr/bin/python3",
+        "import os",
+        'echo "SUID Binary Executed"',
+        'os.system("/bin/sh")',
+    ]
+    # Everything else about the task (mode, dest) is untouched.
+    assert repaired[0]["ansible.builtin.copy"]["mode"] == "04755"
+
+
+def test_repair_escaped_newlines_in_script_content_leaves_normal_tasks_untouched():
+    # A correctly-written block-scalar script (real newlines already) -
+    # nothing to fix, and no literal \n present to trigger on anyway.
+    block_scalar_tasks = yaml.safe_load(
+        "- name: x\n  ansible.builtin.copy:\n    content: |\n      #!/bin/sh\n      exec /bin/sh\n    dest: /usr/local/x\n    mode: '04755'\n"
+    )
+    # A task with no copy/content at all.
+    other_tasks = yaml.safe_load("- name: y\n  ansible.builtin.package:\n    name: apache2\n    state: present\n")
+    # copy: content that isn't a flattened script (no shebang) - e.g. the
+    # static admin-panel HTML page from the web-app-misconfig scenario -
+    # must never be touched, even though it may legitimately contain `\n`
+    # as part of its own text.
+    non_script_tasks = yaml.safe_load(
+        "- name: z\n  ansible.builtin.copy:\n    content: '<html>not a script</html>'\n    dest: /var/www/html/z.html\n"
+    )
+
+    for tasks in (block_scalar_tasks, other_tasks, non_script_tasks):
+        repaired, notes = repair_escaped_newlines_in_script_content(tasks)
+        assert notes == []
+        assert repaired == tasks
+
+
+def test_write_ansible_role_recovers_from_real_suid_newline_bug(tmp_path):
+    raw_output = (
+        f"```yaml\n{SUID_ESCAPED_NEWLINE_YAML}```\n\n**Applied misconfigurations:**\n"
+        "1. `mode: '04755'` - an SUID binary allowing privilege escalation.\n"
+    )
+
+    role_dir, repairs = write_ansible_role(raw_output, tmp_path / "run")
+
+    assert len(repairs) == 1
+    assert "newline" in repairs[0]
+    tasks = yaml.safe_load((role_dir / "tasks" / "main.yml").read_text(encoding="utf-8"))
+    content = tasks[0]["ansible.builtin.copy"]["content"]
+    assert "\\n" not in content
+    assert content.startswith("#!/usr/bin/python3\n")

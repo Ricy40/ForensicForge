@@ -275,6 +275,61 @@ def repair_user_module_path_misuse(tasks: list[dict]) -> tuple[list[dict], list[
     return repaired, notes
 
 
+def repair_escaped_newlines_in_script_content(tasks: list[dict]) -> tuple[list[dict], list[str]]:
+    """Turn literal backslash-n sequences into real newlines in an
+    `ansible.builtin.copy` task's `content:`, when the whole field is
+    plainly a flattened multi-line script rather than genuine content.
+
+    Real example (local-privesc, week 7): an SUID "binary" was written as
+
+        content: '#!/usr/bin/python3\\nimport os\\necho "SUID Binary
+          Executed"\\nos.system("/bin/sh")'
+
+    - a single-quoted YAML scalar. Single-quoted YAML strings never
+    interpret backslash escapes (only doubling a quote, `''`, means
+    anything), so every `\\n` in it came through as two literal
+    characters, not a line break. The result on disk is a one-line file
+    whose "shebang" is the entire garbled string, which the kernel can't
+    resolve to a real interpreter - confirmed live: executing it returned
+    `<path>: not found`, the exact symptom of an unresolvable shebang.
+    The file's `mode:` (e.g. `04755`) is still applied and still verifies
+    correctly against the live VM - only the content is broken, so
+    neither `verify-vulnerabilities` (which only checks mode/lineinfile
+    claims) nor any existing repair caught this class of bug.
+
+    Deliberately narrow, matching the shape actually seen: only triggers
+    when the content has no real newline yet, starts with a shebang
+    (`#!`), and contains at least one literal `\\n`. A script's content
+    legitimately containing `\\n` as text (e.g. a Python string literal
+    inside a *correctly* multi-line file) is common, so blindly replacing
+    every `\\n` in any `copy:` content would be wrong; restricting to a
+    single-line, shebang-prefixed field makes it overwhelmingly likely
+    every `\\n` present was meant to be a real line break, since that's
+    the only way a shebang script can be structured at all.
+    """
+    repaired: list[dict] = []
+    notes: list[str] = []
+
+    for task in tasks:
+        args = task.get("ansible.builtin.copy")
+        content = args.get("content") if isinstance(args, dict) else None
+        if not isinstance(content, str) or "\n" in content or not content.startswith("#!") or "\\n" not in content:
+            repaired.append(task)
+            continue
+
+        new_task = copy.deepcopy(task)
+        new_task["ansible.builtin.copy"]["content"] = content.replace("\\n", "\n")
+        repaired.append(new_task)
+        notes.append(
+            f"converted literal \\n sequences to real newlines in task "
+            f"{task.get('name', '')!r}'s copy content: (single-quoted YAML "
+            f"doesn't interpret backslash escapes, so the intended multi-line "
+            f"script had collapsed onto one unusable line)"
+        )
+
+    return repaired, notes
+
+
 def repair_dangling_notify(tasks: list[dict]) -> tuple[list[dict], list[str]]:
     """Strip any `notify:` key referencing a handler, since this pipeline
     never writes a handlers/main.yml for one to exist in.

@@ -6,6 +6,7 @@ import yaml
 
 from .repair import (
     repair_dangling_notify,
+    repair_escaped_newlines_in_script_content,
     repair_lineinfile_backreferences,
     repair_misindented_task,
     repair_trailing_handlers_block,
@@ -144,6 +145,8 @@ def parse_tasks(yaml_text: str, raw_output: str) -> tuple[list[dict], list[str]]
     repair_notes.extend(user_path_notes)
     tasks, notify_notes = repair_dangling_notify(tasks)
     repair_notes.extend(notify_notes)
+    tasks, newline_notes = repair_escaped_newlines_in_script_content(tasks)
+    repair_notes.extend(newline_notes)
     _reject_external_file_references(tasks, raw_output)
     _reject_interactive_commands(tasks, raw_output)
     _reject_nonexistent_modules(tasks, raw_output)
